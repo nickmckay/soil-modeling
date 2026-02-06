@@ -335,7 +335,7 @@ getF14R_npool <- function(model_output) {
 
   # Respiration rate for each pool = k_i - transfer_out_i
   # (what leaves pool i but doesn't go to another pool)
-  resp_rate <- k + transfer_out  # Note: A[i,i] = -k[i], so transfer_out is positive
+  resp_rate <- k - transfer_out
 
   n_times <- nrow(C)
   Delta14C_resp <- numeric(n_times)
@@ -360,6 +360,49 @@ getF14R_npool <- function(model_output) {
   }
 
   return(Delta14C_resp)
+}
+
+#' Get carbon stocks of each individual pool (analogous to SoilR's getC)
+#'
+#' @param model_output Output from solve_npool_model
+#' @return Matrix of carbon stocks (times x n)
+getC_npool <- function(model_output) {
+  return(model_output$C)
+}
+
+#' Get release flux (respiration) from each pool (analogous to SoilR's getReleaseFlux)
+#'
+#' Respiration from pool j = (k_j - sum of transfer rates out of j) * C_j
+#'
+#' @param model_output Output from solve_npool_model
+#' @return Matrix of release fluxes (times x n)
+getReleaseFlux_npool <- function(model_output) {
+  C <- model_output$C
+  A <- model_output$A
+  k <- model_output$k
+  n <- length(k)
+
+  # Sum of transfer coefficients going OUT of each pool
+  transfer_out <- numeric(n)
+  for (j in 1:n) {
+    for (i in 1:n) {
+      if (i != j) {
+        transfer_out[j] <- transfer_out[j] + A[i, j]
+      }
+    }
+  }
+
+  # Respiration rate for each pool
+  resp_rate <- k - transfer_out
+
+  # Respiration flux = resp_rate * C (for each time step)
+  n_times <- nrow(C)
+  release <- matrix(0, nrow = n_times, ncol = n)
+  for (j in 1:n) {
+    release[, j] <- resp_rate[j] * C[, j]
+  }
+
+  return(release)
 }
 
 # =============================================================================
