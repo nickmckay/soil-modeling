@@ -50,8 +50,7 @@ jobs:
 
       - name: Install R packages
         run: |
-          install.packages(c("rmarkdown", "deSolve", "ggplot2", "dplyr", "tidyr", "patchwork", "BayesianTools"), repos = "https://cloud.r-project.org")
-          install.packages("SoilR", repos = "https://r-forge.r-project.org")
+          install.packages(c("rmarkdown", "deSolve", "ggplot2", "dplyr", "tidyr", "patchwork", "BayesianTools", "SoilR"), repos = "https://cloud.r-project.org")
         shell: Rscript {0}
 
       - name: Render 1-pool tutorial

@@ -66,11 +66,14 @@ run_and_summarize <- function(likelihood_fn, prior = NULL,
     settings      = list(iterations = iterations, message = FALSE)
   )
 
-  # Extract raw chains for trace plots
-  raw_chains <- getSample(mcmc_out, start = 1, coda = TRUE)
+  # Extract raw chains for trace plots (including log-posterior)
+  raw_chains <- getSample(mcmc_out, start = 1, coda = TRUE, parametersOnly = FALSE)
   chain_df <- do.call(rbind, lapply(seq_along(raw_chains), function(i) {
     ch <- as.data.frame(as.matrix(raw_chains[[i]]))
-    colnames(ch) <- par_names
+    n_par <- length(par_names)
+    colnames(ch)[1:n_par] <- par_names
+    ch$log_posterior <- ch[, n_par + 1]
+    ch <- ch[, c(par_names, "log_posterior")]
     ch$iteration <- seq_len(nrow(ch))
     ch$chain <- factor(i)
     ch
@@ -402,22 +405,24 @@ cat("Retained", nrow(result_default$posterior_df), "posterior samples")
 
 A **trace plot** shows the value each chain visited at each iteration. Well-behaved chains should look like "hairy caterpillars" -- bouncing randomly around a stable region with no visible trends or long drifts.
 
-```{r trace-default, fig.height=5}
+```{r trace-default, fig.height=7}
 chain_long_default <- result_default$chain_df %>%
-  pivot_longer(cols = c("k", "input"),
+  pivot_longer(cols = c("k", "input", "log_posterior"),
                names_to = "parameter", values_to = "value") %>%
-  mutate(parameter = factor(parameter, levels = c("k", "input"),
-                            labels = c("k (yr^-1)", "input (gC/m2/yr)")))
+  mutate(parameter = factor(parameter, levels = c("k", "input", "log_posterior"),
+                            labels = c("k (yr^-1)", "input (gC/m2/yr)", "Log-posterior")))
 
 ggplot(chain_long_default, aes(x = iteration, y = value, color = chain)) +
   geom_line(alpha = 0.5) +
   facet_wrap(~ parameter, scales = "free_y", ncol = 1) +
   labs(title = "MCMC Trace Plots (Default Settings)",
-       subtitle = "Each color is a separate chain. Look for good mixing.",
+       subtitle = "Each color is a separate chain. The log-posterior should plateau when chains converge.",
        x = "Iteration", y = "Value") +
   theme_minimal(base_size = 14) +
   theme(legend.position = "top")
 ```
+
+The **log-posterior** panel (bottom) is especially useful for setting burn-in: it shows the objective value the sampler is trying to maximize. The initial climb represents chains finding the high-probability region. Once the log-posterior reaches a stable plateau, the chains have converged. Everything before the plateau is burn-in.
 
 ## Burn-in and thinning
 
@@ -425,7 +430,7 @@ The first part of each chain (before it finds the high-probability region) is ca
 
 **Thinning** means keeping only every Nth sample. This reduces autocorrelation -- the tendency for successive samples to be very similar -- giving us more independent draws.
 
-```{r burnin-visual, fig.height=5}
+```{r burnin-visual, fig.height=7}
 ggplot(chain_long_default, aes(x = iteration, y = value, color = chain)) +
   geom_line(alpha = 0.5) +
   geom_vline(xintercept = result_default$burn_in / 3, color = "black",
@@ -764,18 +769,18 @@ result_few <- run_and_summarize(
 )
 ```
 
-```{r trace-few-iters, fig.height=5}
+```{r trace-few-iters, fig.height=7}
 chain_long_few <- result_few$chain_df %>%
-  pivot_longer(cols = c("k", "input"),
+  pivot_longer(cols = c("k", "input", "log_posterior"),
                names_to = "parameter", values_to = "value") %>%
-  mutate(parameter = factor(parameter, levels = c("k", "input"),
-                            labels = c("k (yr^-1)", "input (gC/m2/yr)")))
+  mutate(parameter = factor(parameter, levels = c("k", "input", "log_posterior"),
+                            labels = c("k (yr^-1)", "input (gC/m2/yr)", "Log-posterior")))
 
 ggplot(chain_long_few, aes(x = iteration, y = value, color = chain)) +
   geom_line(alpha = 0.6) +
   facet_wrap(~ parameter, scales = "free_y", ncol = 1) +
   labs(title = "Trace Plots: Too Few Iterations (500)",
-       subtitle = "Chains haven't converged -- the posterior estimate will be unreliable",
+       subtitle = "Log-posterior hasn't plateaued -- chains haven't converged",
        x = "Iteration", y = "Value") +
   theme_minimal(base_size = 14) +
   theme(legend.position = "top")

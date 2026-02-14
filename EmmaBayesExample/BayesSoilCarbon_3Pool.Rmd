@@ -73,10 +73,13 @@ run_and_summarize <- function(likelihood_fn, prior = NULL,
     settings      = list(iterations = iterations, message = FALSE)
   )
 
-  raw_chains <- getSample(mcmc_out, start = 1, coda = TRUE)
+  raw_chains <- getSample(mcmc_out, start = 1, coda = TRUE, parametersOnly = FALSE)
   chain_df <- do.call(rbind, lapply(seq_along(raw_chains), function(i) {
     ch <- as.data.frame(as.matrix(raw_chains[[i]]))
-    colnames(ch) <- par_names
+    n_par <- length(par_names)
+    colnames(ch)[1:n_par] <- par_names
+    ch$log_posterior <- ch[, n_par + 1]
+    ch <- ch[, c(par_names, "log_posterior")]
     ch$iteration <- seq_len(nrow(ch))
     ch$chain <- factor(i)
     ch
@@ -491,21 +494,26 @@ cat("Retained", nrow(result$posterior_df), "posterior samples")
 
 With 6 parameters, we need a bigger panel. Look for the same "hairy caterpillar" pattern in each -- well-mixed chains bouncing around a stable region.
 
-```{r trace-plots, fig.height=8}
+```{r trace-plots, fig.height=10}
+trace_vars <- c(par_names, "log_posterior")
+trace_labels <- c(par_names, "Log-posterior")
+
 chain_long <- result$chain_df %>%
-  pivot_longer(cols = all_of(par_names),
+  pivot_longer(cols = all_of(c(par_names, "log_posterior")),
                names_to = "parameter", values_to = "value") %>%
-  mutate(parameter = factor(parameter, levels = par_names))
+  mutate(parameter = factor(parameter, levels = trace_vars, labels = trace_labels))
 
 ggplot(chain_long, aes(x = iteration, y = value, color = chain)) +
   geom_line(alpha = 0.4, linewidth = 0.3) +
   facet_wrap(~ parameter, scales = "free_y", ncol = 3) +
   labs(title = "MCMC Trace Plots (3-Pool Model)",
-       subtitle = "Look for mixing and convergence across all chains",
+       subtitle = "Log-posterior (bottom right) should plateau when chains converge",
        x = "Iteration", y = "Value") +
   theme_minimal(base_size = 11) +
   theme(legend.position = "top")
 ```
+
+The **log-posterior** panel is the most important diagnostic: it shows the objective value being maximized. Look for a clear plateau -- the point where the log-posterior stops climbing and starts bouncing around a stable level. This is where the chains have found the high-probability region, and everything before it is burn-in.
 
 Some parameters (like `k3` or `a32` for the slow mineral pool) may show worse mixing than others. This is typical -- slow pools have weak 14C signals, so the data provide less constraint and the chains wander more.
 
@@ -513,7 +521,7 @@ Some parameters (like `k3` or `a32` for the slow mineral pool) may show worse mi
 
 We use a burn-in of 5,000 (vs. 2,000 for the 1-pool model) because the chains need more time to settle in a 6D space. Thinning of 10 reduces autocorrelation.
 
-```{r burnin-visual, fig.height=8}
+```{r burnin-visual, fig.height=10}
 ggplot(chain_long, aes(x = iteration, y = value, color = chain)) +
   geom_line(alpha = 0.4, linewidth = 0.3) +
   geom_vline(xintercept = result$burn_in / 3, color = "black",
@@ -522,7 +530,7 @@ ggplot(chain_long, aes(x = iteration, y = value, color = chain)) +
            label = " Burn-in cutoff", hjust = 0, vjust = 1.5, size = 3.5) +
   facet_wrap(~ parameter, scales = "free_y", ncol = 3) +
   labs(title = "Burn-in Removal",
-       subtitle = "Everything left of the dotted line is discarded",
+       subtitle = "Everything left of the dotted line is discarded. Check that log-posterior has plateaued by the cutoff.",
        x = "Iteration", y = "Value") +
   theme_minimal(base_size = 11) +
   theme(legend.position = "top")
