@@ -1,0 +1,773 @@
+---
+title: "Bayesian Soil Carbon Modeling: A 1-Pool Tutorial"
+author: "Soil Carbon Modeling Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+# 1. Setup
+
+Load the libraries we need and the pre-processed data from the CiPEHR permafrost warming experiment in interior Alaska.
+
+```{r load-libraries}
+library(SoilR)
+library(BayesianTools)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+set.seed(42)
+
+load("soilRmcmc.RData")
+```
+
+We also define a helper function that we'll reuse throughout this tutorial. It runs the MCMC, extracts posterior samples, and computes summary statistics -- all in one call. This avoids copy-pasting the same pipeline every time we want to try different settings.
+
+```{r helper-functions}
+# Run MCMC and return a tidy list of results
+run_and_summarize <- function(likelihood_fn, prior_lower, prior_upper,
+                              par_names = c("k", "input"),
+                              iterations = 10000,
+                              burn_in = 2000, thin = 5) {
+
+  prior <- createUniformPrior(lower = prior_lower, upper = prior_upper)
+
+  bt_setup <- createBayesianSetup(
+    likelihood = likelihood_fn,
+    prior      = prior,
+    names      = par_names
+  )
+
+  mcmc_out <- runMCMC(
+    bayesianSetup = bt_setup,
+    sampler       = "DREAMzs",
+    settings      = list(iterations = iterations, message = FALSE)
+  )
+
+  # Extract raw chains for trace plots
+  raw_chains <- getSample(mcmc_out, start = 1, coda = TRUE)
+  chain_df <- do.call(rbind, lapply(seq_along(raw_chains), function(i) {
+    ch <- as.data.frame(as.matrix(raw_chains[[i]]))
+    colnames(ch) <- par_names
+    ch$iteration <- seq_len(nrow(ch))
+    ch$chain <- factor(i)
+    ch
+  }))
+
+  # Extract post-burn-in, thinned samples
+  samples <- getSample(mcmc_out, start = burn_in, thin = thin)
+  colnames(samples) <- par_names
+  posterior_df <- as.data.frame(samples)
+
+  # MAP estimate
+  map_est <- MAP(mcmc_out, start = burn_in)$parametersMAP
+  names(map_est) <- par_names
+
+  # Summary table
+  summary_tbl <- posterior_df %>%
+    pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+    group_by(parameter) %>%
+    summarise(
+      median   = median(value),
+      lower_90 = quantile(value, 0.05),
+      upper_90 = quantile(value, 0.95),
+      .groups  = "drop"
+    )
+
+  list(
+    mcmc_out     = mcmc_out,
+    chain_df     = chain_df,
+    posterior_df = posterior_df,
+    map          = map_est,
+    summary      = summary_tbl,
+    burn_in      = burn_in,
+    thin         = thin
+  )
+}
+```
+
+
+# 2. Background: What is Bayesian Inference?
+
+Imagine you're trying to figure out how fast soil carbon decomposes. Before you look at any data, you have some rough idea -- maybe from the literature, maybe from experience. That's your **prior belief**.
+
+Then you collect data -- radiocarbon measurements from soil cores. The data tell you something about decomposition, but they're noisy and incomplete. The question is: how do you combine your prior knowledge with the new data to get the best possible estimate?
+
+**Bayes' theorem** gives a principled answer:
+
+$$\text{Posterior} \propto \text{Likelihood} \times \text{Prior}$$
+
+In plain English:
+
+- **Prior**: What you believed before seeing data. Broad if you're uncertain, narrow if you have strong expectations.
+- **Likelihood**: How well a particular parameter value explains the observed data. This is where the data speak.
+- **Posterior**: Your updated belief after combining prior and data. This is what we want.
+
+Think of it like a court trial. The prior is your initial impression of the defendant. The likelihood is the evidence presented. The posterior is the jury's verdict -- informed by both, but driven more by whichever is stronger.
+
+The rest of this tutorial walks through each piece, step by step, using a real soil carbon dataset.
+
+
+# 3. The Scientific Question and Data
+
+## What is radiocarbon?
+
+Radiocarbon ($^{14}$C) is a naturally occurring radioactive isotope of carbon. It decays slowly (half-life ~5,730 years), which makes it useful for dating old materials. But for soil science, the really powerful tool is the **bomb spike**.
+
+Nuclear weapons testing in the 1950s--60s nearly doubled the amount of $^{14}$C in the atmosphere. Since then, it has been declining as the excess $^{14}$C gets absorbed into oceans, vegetation, and soils. This pulse acts like a tracer: fast-cycling soil carbon pools quickly incorporated the bomb $^{14}$C and are now losing it, while slow-cycling pools barely responded.
+
+By measuring how much bomb $^{14}$C is in soil today, we can estimate how fast carbon cycles through the soil -- the **turnover time**.
+
+```{r plot-bomb-curve, fig.height=4}
+ggplot(subset(atmIn, YEAR >= 1940), aes(x = YEAR, y = Atmosphere)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  labs(title = "Atmospheric 14C: The Bomb Spike",
+       subtitle = "Nuclear testing doubled atmospheric 14C in the 1960s; it has declined since",
+       x = "Year", y = expression(Delta^14 * "C (per mil)")) +
+  theme_minimal(base_size = 14)
+```
+
+## The CiPEHR observations
+
+Our data come from the CiPEHR (Carbon in Permafrost, Experimental Heating Research) experiment in interior Alaska. Soil cores were measured at two time points: 2009 (baseline) and 2022 (after 13 years). Each core is divided into three layers (surface organic, deep organic, mineral), with measurements of both carbon stock (how much carbon is there) and $\Delta^{14}$C (how "old" it is).
+
+```{r show-data}
+knitr::kable(as.data.frame(datComb), digits = 1,
+             caption = "Soil observations from CiPEHR experiment")
+```
+
+## Aggregating to a 1-pool bulk value
+
+For this tutorial, we simplify: instead of modeling three separate layers, we combine them into a single "bulk soil" pool. We sum the carbon stocks across layers, and compute a stock-weighted mean for $^{14}$C. This gives us just two observations (2009 and 2022) to work with.
+
+This is a deliberate simplification for learning. A real analysis might model the layers separately (as the 3-pool model in `BayesSoilCarbon_Tutorial.R` does), but the 1-pool version lets us focus on the Bayesian machinery without getting lost in model complexity.
+
+```{r aggregate-1pool}
+dat_1pool <- datComb %>%
+  filter(year == 2009 | treatment == "Control") %>%
+  mutate(C_stock_g    = C_stock * 1000,
+         C_stock_sd_g = C_stock_sd * 1000) %>%
+  group_by(year) %>%
+  summarise(
+    C14        = weighted.mean(C14, C_stock_g),
+    C_14_sd    = sqrt(sum((C_stock_g * C_14_sd)^2)) / sum(C_stock_g),
+    C_stock    = sum(C_stock_g),
+    C_stock_sd = sqrt(sum(C_stock_sd_g^2)),
+    .groups = "drop"
+  )
+
+knitr::kable(dat_1pool, digits = 1,
+             caption = "Aggregated 1-pool bulk observations")
+
+# Initial conditions from 2009
+C0_1pool <- dat_1pool$C_stock[dat_1pool$year == 2009]
+F0_1pool <- dat_1pool$C14[dat_1pool$year == 2009]
+years_1pool <- seq(2009, 2022)
+```
+
+
+# 4. The Forward Model
+
+The forward model is the heart of the analysis. Given a set of parameter values, it predicts what we should observe. For the 1-pool model, there are just two parameters:
+
+- **k** (yr$^{-1}$): the decomposition rate. Higher k means faster turnover. Turnover time = 1/k.
+- **input** (gC/m$^2$/yr): the rate at which new carbon enters the soil from plant litter.
+
+The model starts from our 2009 observations (initial carbon stock and $^{14}$C) and runs forward to 2022, tracking how the carbon stock and its $^{14}$C signature evolve over time.
+
+Let's see what the model predicts for a few hand-picked values of k, holding input fixed. This will build intuition for how the parameter controls the model output.
+
+```{r forward-model-demo, fig.height=6}
+years_plot <- seq(2009, 2022, by = 0.5)
+k_values <- c(0.005, 0.01, 0.02, 0.05)
+input_fixed <- 300
+
+forward_runs <- bind_rows(lapply(k_values, function(k_val) {
+  m <- OnepModel14(
+    t = years_plot, k = k_val, C0 = C0_1pool,
+    F0_Delta14C = F0_1pool, In = input_fixed,
+    inputFc = atmIn, pass = TRUE
+  )
+  data.frame(
+    year = years_plot,
+    C14 = as.numeric(getF14(m)),
+    C_stock = as.numeric(getC(m)),
+    k = paste0("k = ", k_val)
+  )
+}))
+
+p_demo_c14 <- ggplot(forward_runs, aes(x = year, y = C14, color = k)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = dat_1pool, aes(x = year, y = C14),
+             inherit.aes = FALSE, size = 4) +
+  geom_errorbar(data = dat_1pool,
+                aes(x = year, ymin = C14 - C_14_sd, ymax = C14 + C_14_sd),
+                inherit.aes = FALSE, width = 0.3) +
+  labs(title = expression(paste("Forward model predictions: ", Delta^14, "C")),
+       subtitle = paste("Input fixed at", input_fixed, "gC/m2/yr"),
+       x = "Year", y = expression(Delta^14 * "C (per mil)"),
+       color = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+p_demo_cstock <- ggplot(forward_runs, aes(x = year, y = C_stock / 1000, color = k)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = dat_1pool, aes(x = year, y = C_stock / 1000),
+             inherit.aes = FALSE, size = 4) +
+  geom_errorbar(data = dat_1pool,
+                aes(x = year, ymin = (C_stock - C_stock_sd) / 1000,
+                    ymax = (C_stock + C_stock_sd) / 1000),
+                inherit.aes = FALSE, width = 0.3) +
+  labs(title = "Forward model predictions: Carbon stock",
+       subtitle = paste("Input fixed at", input_fixed, "gC/m2/yr"),
+       x = "Year", y = expression(paste("C stock (kg m"^-2, ")")),
+       color = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+p_demo_c14 / p_demo_cstock
+```
+
+Notice how different k values produce very different trajectories. Some are close to the data, others are far off. This is exactly the problem Bayesian inference solves: **which parameter values are most consistent with our observations?**
+
+
+# 5. The Likelihood Function
+
+The **likelihood** answers the question: "If the true parameters were (k, input), how probable is it that we'd observe the data we actually got?"
+
+We assume that measurement errors follow a normal (Gaussian) distribution centered on the true value, with a standard deviation equal to the reported measurement uncertainty. The likelihood for a single observation is:
+
+$$L(\theta) = \frac{1}{\sigma\sqrt{2\pi}} \exp\left(-\frac{(\text{prediction} - \text{observation})^2}{2\sigma^2}\right)$$
+
+We work with the **log-likelihood** (sum of log-probabilities) because it's numerically more stable. Higher log-likelihood = better fit.
+
+```{r define-likelihood}
+obs_2022_1pool <- dat_1pool %>% filter(year == 2022)
+
+likelihood_1pool <- function(pars) {
+  k     <- pars[1]
+  input <- pars[2]
+
+  model <- tryCatch(
+    OnepModel14(
+      t = years_1pool, k = k, C0 = C0_1pool,
+      F0_Delta14C = F0_1pool, In = input,
+      inputFc = atmIn, pass = TRUE
+    ),
+    error = function(e) return(NULL)
+  )
+
+  if (is.null(model)) return(-1e10)
+
+  pred_C14    <- getF14(model)[length(years_1pool), ]
+  pred_Cstock <- getC(model)[length(years_1pool), ]
+
+  ll_C14    <- dnorm(pred_C14 - obs_2022_1pool$C14, 0,
+                     obs_2022_1pool$C_14_sd, log = TRUE)
+  ll_Cstock <- dnorm(pred_Cstock - obs_2022_1pool$C_stock, 0,
+                     obs_2022_1pool$C_stock_sd, log = TRUE)
+
+  return(sum(ll_C14, ll_Cstock, na.rm = TRUE))
+}
+
+# Sanity check
+cat("Test likelihood at k=0.01, input=500:", likelihood_1pool(c(0.01, 500)))
+```
+
+## Visualizing the likelihood surface
+
+To build intuition, let's evaluate the likelihood across a grid of (k, input) values and plot it as a heatmap. This shows us where in parameter space the data "want" the answer to be.
+
+```{r likelihood-surface, fig.height=5}
+k_grid     <- seq(0.002, 0.08, length.out = 60)
+input_grid <- seq(50, 900, length.out = 60)
+grid_df    <- expand.grid(k = k_grid, input = input_grid)
+
+grid_df$ll <- sapply(seq_len(nrow(grid_df)), function(i) {
+  likelihood_1pool(c(grid_df$k[i], grid_df$input[i]))
+})
+
+# Truncate very low values for better color scale
+grid_df$ll_plot <- pmax(grid_df$ll, max(grid_df$ll) - 30)
+
+ggplot(grid_df, aes(x = k, y = input, fill = ll_plot)) +
+  geom_raster() +
+  scale_fill_viridis_c(option = "inferno", name = "Log-likelihood") +
+  geom_contour(aes(z = ll_plot), color = "white", alpha = 0.5, bins = 8) +
+  labs(title = "Likelihood surface for the 1-pool model",
+       subtitle = "Brighter = better fit. Note the ridge: k and input trade off.",
+       x = expression(paste("k (yr"^-1, ")")),
+       y = expression(paste("input (gC m"^-2, " yr"^-1, ")"))) +
+  theme_minimal(base_size = 14)
+```
+
+Notice the **ridge** running diagonally through the plot. This means k and input are correlated: a faster decomposition rate can be compensated by higher carbon input, and vice versa. The data constrain a *combination* of the two parameters better than either one individually.
+
+
+# 6. The Prior
+
+The **prior** encodes what we believe about the parameters *before* seeing the data. For this first run, we use **uniform (flat) priors** -- every value within the specified range is considered equally likely a priori.
+
+For a bulk permafrost soil profile, reasonable ranges are:
+
+- **k**: 0.001 to 0.1 yr$^{-1}$ (turnover time of 10 to 1,000 years)
+- **input**: 50 to 1,000 gC/m$^2$/yr
+
+```{r define-default-prior, fig.height=3.5}
+prior_lower_default <- c(k = 0.001, input = 50)
+prior_upper_default <- c(k = 0.1,   input = 1000)
+
+prior_samples_default <- data.frame(
+  k     = runif(10000, prior_lower_default["k"],     prior_upper_default["k"]),
+  input = runif(10000, prior_lower_default["input"], prior_upper_default["input"])
+)
+
+prior_long_default <- prior_samples_default %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = c("k", "input"),
+                            labels = c("k (yr^-1)", "input (gC/m2/yr)")))
+
+ggplot(prior_long_default, aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50,
+                 fill = "skyblue", color = "white", alpha = 0.7) +
+  facet_wrap(~ parameter, scales = "free", ncol = 2) +
+  labs(title = "Default Prior Distributions",
+       subtitle = "Uniform: every value in the range is equally likely",
+       x = "Parameter value", y = "Density") +
+  theme_minimal(base_size = 14)
+```
+
+A uniform prior is the simplest choice, but it's not the only one. Later, we'll experiment with different priors to see how they affect the results.
+
+
+# 7. Running MCMC (Default Settings)
+
+## What does MCMC do?
+
+We know the posterior is proportional to likelihood times prior. But actually *computing* the full posterior distribution over a grid of parameter values is expensive (and gets exponentially worse with more parameters). **Markov Chain Monte Carlo (MCMC)** is an algorithm that *samples* from the posterior distribution without having to evaluate it everywhere.
+
+Think of it like a random walk through parameter space, where you're more likely to visit regions of high posterior probability. After enough steps, the collection of visited points approximates the posterior distribution.
+
+We use the **DREAMzs** sampler, which runs multiple interacting chains. For a 2-parameter problem, 10,000 iterations is usually plenty.
+
+```{r run-default-mcmc}
+result_default <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior_lower   = prior_lower_default,
+  prior_upper   = prior_upper_default,
+  iterations    = 10000,
+  burn_in       = 2000,
+  thin          = 5
+)
+
+cat("Retained", nrow(result_default$posterior_df), "posterior samples")
+```
+
+## Trace plots: diagnosing convergence
+
+A **trace plot** shows the value each chain visited at each iteration. Well-behaved chains should look like "hairy caterpillars" -- bouncing randomly around a stable region with no visible trends or long drifts.
+
+```{r trace-default, fig.height=5}
+chain_long_default <- result_default$chain_df %>%
+  pivot_longer(cols = c("k", "input"),
+               names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = c("k", "input"),
+                            labels = c("k (yr^-1)", "input (gC/m2/yr)")))
+
+ggplot(chain_long_default, aes(x = iteration, y = value, color = chain)) +
+  geom_line(alpha = 0.5) +
+  facet_wrap(~ parameter, scales = "free_y", ncol = 1) +
+  labs(title = "MCMC Trace Plots (Default Settings)",
+       subtitle = "Each color is a separate chain. Look for good mixing.",
+       x = "Iteration", y = "Value") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+## Burn-in and thinning
+
+The first part of each chain (before it finds the high-probability region) is called **burn-in**. We discard these early samples because they don't represent the posterior.
+
+**Thinning** means keeping only every Nth sample. This reduces autocorrelation -- the tendency for successive samples to be very similar -- giving us more independent draws.
+
+```{r burnin-visual, fig.height=5}
+ggplot(chain_long_default, aes(x = iteration, y = value, color = chain)) +
+  geom_line(alpha = 0.5) +
+  geom_vline(xintercept = result_default$burn_in / 3, color = "black",
+             linewidth = 1, linetype = "dotted") +
+  annotate("text", x = result_default$burn_in / 3, y = Inf,
+           label = " Burn-in cutoff", hjust = 0, vjust = 1.5, size = 4) +
+  facet_wrap(~ parameter, scales = "free_y", ncol = 1) +
+  labs(title = "Burn-in Removal",
+       subtitle = "Everything left of the dotted line is discarded",
+       x = "Iteration", y = "Value") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+## Prior vs. posterior
+
+The moment of truth: how much did the data narrow down our estimates?
+
+```{r prior-vs-posterior-default, fig.height=4}
+posterior_long_default <- result_default$posterior_df %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = c("k", "input"),
+                            labels = c("k (yr^-1)", "input (gC/m2/yr)")))
+
+ggplot() +
+  geom_histogram(data = prior_long_default,
+                 aes(x = value, y = after_stat(density)),
+                 bins = 50, fill = "skyblue", alpha = 0.4, color = "white") +
+  geom_density(data = posterior_long_default, aes(x = value),
+               fill = "coral", alpha = 0.5, linewidth = 1) +
+  facet_wrap(~ parameter, scales = "free", ncol = 2) +
+  labs(title = "Prior (blue) vs. Posterior (coral)",
+       subtitle = "The data have substantially narrowed our parameter estimates",
+       x = "Parameter value", y = "Density") +
+  theme_minimal(base_size = 14)
+```
+
+## MAP estimate and credible intervals
+
+The **MAP** (Maximum A Posteriori) is the single most probable parameter combination. The **90% credible interval** tells us the range containing 90% of the posterior probability.
+
+```{r map-summary-default}
+cat("=== 1-Pool Posterior Summary (Default) ===\n")
+cat(sprintf("%-8s  %8s  %10s  %10s  %10s\n",
+            "Param", "MAP", "Median", "90% lo", "90% hi"))
+for (i in seq_len(nrow(result_default$summary))) {
+  r <- result_default$summary[i, ]
+  cat(sprintf("%-8s  %8.4f  %10.4f  %10.4f  %10.4f\n",
+              r$parameter, result_default$map[r$parameter],
+              r$median, r$lower_90, r$upper_90))
+}
+```
+
+## Model predictions with uncertainty
+
+We run the forward model at the MAP estimate (best fit line) and at 200 random posterior draws (uncertainty envelope).
+
+```{r predictions-default, fig.height=6}
+years_plot <- seq(2009, 2022, by = 0.5)
+
+# MAP prediction
+map_model <- OnepModel14(
+  t = years_plot, k = result_default$map["k"], C0 = C0_1pool,
+  F0_Delta14C = F0_1pool, In = result_default$map["input"],
+  inputFc = atmIn, pass = TRUE
+)
+map_pred <- data.frame(
+  year = years_plot,
+  C14 = as.numeric(getF14(map_model)),
+  C_stock = as.numeric(getC(map_model))
+)
+
+# Posterior ensemble
+n_draws <- min(200, nrow(result_default$posterior_df))
+draw_idx <- sample(nrow(result_default$posterior_df), n_draws)
+
+ensemble <- bind_rows(lapply(draw_idx, function(i) {
+  m <- tryCatch(
+    OnepModel14(
+      t = years_plot, k = result_default$posterior_df$k[i], C0 = C0_1pool,
+      F0_Delta14C = F0_1pool, In = result_default$posterior_df$input[i],
+      inputFc = atmIn, pass = TRUE
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(m)) return(NULL)
+  data.frame(year = years_plot,
+             C14 = as.numeric(getF14(m)),
+             C_stock = as.numeric(getC(m)))
+}))
+
+envelope <- ensemble %>%
+  group_by(year) %>%
+  summarise(
+    C14_lo = quantile(C14, 0.05), C14_hi = quantile(C14, 0.95),
+    Cstock_lo = quantile(C_stock, 0.05), Cstock_hi = quantile(C_stock, 0.95),
+    .groups = "drop"
+  )
+
+p_c14 <- ggplot() +
+  geom_ribbon(data = envelope, aes(x = year, ymin = C14_lo, ymax = C14_hi),
+              fill = "steelblue", alpha = 0.3) +
+  geom_line(data = map_pred, aes(x = year, y = C14),
+            color = "steelblue", linewidth = 1.2) +
+  geom_point(data = dat_1pool, aes(x = year, y = C14), size = 4) +
+  geom_errorbar(data = dat_1pool,
+                aes(x = year, ymin = C14 - C_14_sd, ymax = C14 + C_14_sd),
+                width = 0.3, linewidth = 0.8) +
+  labs(title = expression(paste("Bulk Soil ", Delta^14, "C")),
+       subtitle = "Line = MAP estimate. Shaded = 90% posterior envelope.",
+       x = "Year", y = expression(paste(Delta^14, "C (per mil)"))) +
+  theme_minimal(base_size = 14)
+
+p_cstock <- ggplot() +
+  geom_ribbon(data = envelope,
+              aes(x = year, ymin = Cstock_lo / 1000, ymax = Cstock_hi / 1000),
+              fill = "forestgreen", alpha = 0.3) +
+  geom_line(data = map_pred, aes(x = year, y = C_stock / 1000),
+            color = "forestgreen", linewidth = 1.2) +
+  geom_point(data = dat_1pool, aes(x = year, y = C_stock / 1000), size = 4) +
+  geom_errorbar(data = dat_1pool,
+                aes(x = year, ymin = (C_stock - C_stock_sd) / 1000,
+                    ymax = (C_stock + C_stock_sd) / 1000),
+                width = 0.3, linewidth = 0.8) +
+  labs(title = "Bulk Soil Carbon Stock",
+       subtitle = "Line = MAP estimate. Shaded = 90% posterior envelope.",
+       x = "Year", y = expression(paste("C stock (kg m"^-2, ")"))) +
+  theme_minimal(base_size = 14)
+
+p_c14 / p_cstock
+```
+
+
+# 8. Experiment: Effect of Changing Priors
+
+One of the most important things to understand about Bayesian inference is how the **prior** interacts with the **likelihood**. In this section, we run the same MCMC with four different priors and compare the results.
+
+## 8.1 Narrow prior
+
+What if we already have a good idea of where the answer should be? A narrow prior concentrates probability mass in a small region.
+
+```{r prior-narrow}
+result_narrow <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior_lower   = c(k = 0.005, input = 100),
+  prior_upper   = c(k = 0.03,  input = 500),
+  iterations    = 10000,
+  burn_in       = 2000,
+  thin          = 5
+)
+```
+
+## 8.2 Offset prior
+
+What if our prior beliefs are *wrong* -- placing most of the probability in a region the data don't support? This is the most dramatic demonstration of prior influence.
+
+```{r prior-offset}
+result_offset <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior_lower   = c(k = 0.05, input = 600),
+  prior_upper   = c(k = 0.10, input = 1000),
+  iterations    = 10000,
+  burn_in       = 2000,
+  thin          = 5
+)
+```
+
+## 8.3 Very wide prior
+
+What if we're completely agnostic -- allowing an enormous range of values?
+
+```{r prior-wide}
+result_wide <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior_lower   = c(k = 0.0001, input = 10),
+  prior_upper   = c(k = 0.5,    input = 2000),
+  iterations    = 10000,
+  burn_in       = 2000,
+  thin          = 5
+)
+```
+
+## 8.4 Comparing all four posteriors
+
+```{r compare-priors, fig.height=7}
+# Combine posteriors from all runs
+label_posterior <- function(df, label) {
+  df %>%
+    pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+    mutate(prior_type = label,
+           parameter = factor(parameter, levels = c("k", "input"),
+                              labels = c("k (yr^-1)", "input (gC/m2/yr)")))
+}
+
+all_posteriors <- bind_rows(
+  label_posterior(result_default$posterior_df, "Default"),
+  label_posterior(result_narrow$posterior_df,  "Narrow"),
+  label_posterior(result_offset$posterior_df,  "Offset"),
+  label_posterior(result_wide$posterior_df,    "Very wide")
+) %>%
+  mutate(prior_type = factor(prior_type,
+                             levels = c("Default", "Narrow", "Offset", "Very wide")))
+
+ggplot(all_posteriors, aes(x = value, fill = prior_type)) +
+  geom_density(alpha = 0.4, linewidth = 0.6) +
+  facet_wrap(~ parameter, scales = "free", ncol = 1) +
+  scale_fill_brewer(palette = "Set1", name = "Prior") +
+  labs(title = "Effect of Prior Choice on the Posterior",
+       subtitle = "Same data and likelihood, different priors",
+       x = "Parameter value", y = "Density") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+**What to notice:**
+
+- **Default and Very wide** give similar posteriors -- when the data are informative, the prior doesn't matter much as long as it covers the high-likelihood region.
+- **Narrow** gives a slightly tighter posterior because the prior itself excludes some parameter combinations that the data would otherwise allow.
+- **Offset** is the cautionary tale: when the prior completely excludes the region the data favor, the posterior piles up at the prior boundary. The MCMC can't go where the prior says "impossible," no matter how much the data want it there. This illustrates **prior dominance** -- in real applications, always check that your prior is broad enough to not exclude plausible values.
+
+
+# 9. Experiment: Effect of MCMC Settings
+
+The prior and likelihood define the posterior, but the *MCMC sampler* is just a tool for approximating it. If you run the sampler with poor settings, you'll get a poor approximation. Here we demonstrate three common mistakes.
+
+## 9.1 Too few iterations
+
+With only 500 iterations, the chains haven't had enough time to explore the posterior. The result is a noisy, incomplete picture.
+
+```{r mcmc-few-iters}
+result_few <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior_lower   = prior_lower_default,
+  prior_upper   = prior_upper_default,
+  iterations    = 500,
+  burn_in       = 100,
+  thin          = 1
+)
+```
+
+```{r trace-few-iters, fig.height=5}
+chain_long_few <- result_few$chain_df %>%
+  pivot_longer(cols = c("k", "input"),
+               names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = c("k", "input"),
+                            labels = c("k (yr^-1)", "input (gC/m2/yr)")))
+
+ggplot(chain_long_few, aes(x = iteration, y = value, color = chain)) +
+  geom_line(alpha = 0.6) +
+  facet_wrap(~ parameter, scales = "free_y", ncol = 1) +
+  labs(title = "Trace Plots: Too Few Iterations (500)",
+       subtitle = "Chains haven't converged -- the posterior estimate will be unreliable",
+       x = "Iteration", y = "Value") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+## 9.2 No burn-in removal
+
+What happens if we include the early "wandering" phase? The posterior gets contaminated with samples from before the chains found the high-probability region.
+
+```{r mcmc-no-burnin}
+result_no_burnin <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior_lower   = prior_lower_default,
+  prior_upper   = prior_upper_default,
+  iterations    = 10000,
+  burn_in       = 1,   # essentially no burn-in
+  thin          = 5
+)
+```
+
+## 9.3 Heavy thinning vs. no thinning
+
+**No thinning** (thin = 1): you keep every sample, which means highly autocorrelated draws. The effective sample size is much smaller than the actual number of samples.
+
+**Heavy thinning** (thin = 50): you keep only every 50th sample. Less autocorrelation, but far fewer total samples.
+
+```{r mcmc-thinning}
+result_no_thin <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior_lower   = prior_lower_default,
+  prior_upper   = prior_upper_default,
+  iterations    = 10000,
+  burn_in       = 2000,
+  thin          = 1
+)
+
+result_heavy_thin <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior_lower   = prior_lower_default,
+  prior_upper   = prior_upper_default,
+  iterations    = 10000,
+  burn_in       = 2000,
+  thin          = 50
+)
+```
+
+## 9.4 Comparing MCMC settings
+
+```{r compare-settings, fig.height=7}
+all_settings <- bind_rows(
+  label_posterior(result_default$posterior_df,    "Default (10k, burn=2k, thin=5)"),
+  label_posterior(result_few$posterior_df,        "Too few iterations (500)"),
+  label_posterior(result_no_burnin$posterior_df,  "No burn-in removal"),
+  label_posterior(result_no_thin$posterior_df,    "No thinning (thin=1)"),
+  label_posterior(result_heavy_thin$posterior_df, "Heavy thinning (thin=50)")
+) %>%
+  mutate(prior_type = factor(prior_type,
+                             levels = c("Default (10k, burn=2k, thin=5)",
+                                        "Too few iterations (500)",
+                                        "No burn-in removal",
+                                        "No thinning (thin=1)",
+                                        "Heavy thinning (thin=50)")))
+
+ggplot(all_settings, aes(x = value, fill = prior_type)) +
+  geom_density(alpha = 0.35, linewidth = 0.5) +
+  facet_wrap(~ parameter, scales = "free", ncol = 1) +
+  scale_fill_brewer(palette = "Set2", name = "Settings") +
+  labs(title = "Effect of MCMC Settings on Posterior Approximation",
+       subtitle = "Same model, prior, and data -- only the sampler settings differ",
+       x = "Parameter value", y = "Density") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+**What to notice:**
+
+- **Too few iterations** gives a jagged, unreliable posterior that shifts each time you run it.
+- **No burn-in** often shifts the posterior slightly (or a lot, depending on where chains started) because early, unconverged samples pull the distribution.
+- **No thinning** and **default** are often very similar in shape -- thinning mainly helps when you need independent samples for downstream calculations.
+- **Heavy thinning** can give a noisier estimate simply because you have far fewer retained samples, but the shape should be correct.
+
+The key lesson: always inspect your trace plots and check convergence before trusting the posterior.
+
+
+# 10. Wrapping Up
+
+## Key takeaways
+
+1. **Bayesian inference** combines prior knowledge with data through Bayes' theorem. The posterior distribution tells you what you know *after* seeing the data.
+
+2. **The likelihood** encodes how well each parameter value explains the observations. Visualizing the likelihood surface reveals parameter correlations and identifiability issues.
+
+3. **Priors matter** -- but mainly when data are weak or priors are too narrow. With informative data and reasonable priors, the posterior is driven by the likelihood.
+
+4. **MCMC is an approximation tool**, not magic. Always check convergence with trace plots, remove burn-in, and consider thinning. Insufficient iterations give unreliable results.
+
+5. **Sensitivity analysis is essential**. Running the same model with different priors and MCMC settings (as we did in sections 8--9) tells you how robust your conclusions are.
+
+## Where to go next
+
+- **3-pool model**: The companion script `BayesSoilCarbon_Tutorial.R` extends this analysis to a 3-pool series model with 6 parameters. You'll see how more parameters create new challenges: wider posteriors, stronger correlations, and harder convergence.
+
+- **Try different data**: The `datComb` table also contains a "Warming" treatment. What happens to decomposition rates under experimental warming?
+
+- **Informative priors**: Instead of uniform priors, try using literature values to construct Gaussian priors. How does this change the posterior compared to flat priors?
+
+- **Model comparison**: Could you compare the 1-pool model to a 2-pool or 3-pool model using Bayesian model selection (e.g., DIC or Bayes factors)?
+
+```{r session-info}
+sessionInfo()
+```
