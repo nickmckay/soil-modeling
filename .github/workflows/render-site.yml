@@ -32,6 +32,9 @@ jobs:
         with:
           r-version: 'release'
 
+      - name: Setup Pandoc
+        uses: r-lib/actions/setup-pandoc@v2
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -51,13 +54,23 @@ jobs:
           install.packages("SoilR", repos = "https://r-forge.r-project.org")
         shell: Rscript {0}
 
-      - name: Render tutorial
+      - name: Render 1-pool tutorial
         timeout-minutes: 30
         run: |
           rmarkdown::render(
             "EmmaBayesExample/BayesSoilCarbon_1Pool.Rmd",
             output_dir = "_site",
             output_file = "BayesSoilCarbon_1Pool.html"
+          )
+        shell: Rscript {0}
+
+      - name: Render 3-pool tutorial
+        timeout-minutes: 60
+        run: |
+          rmarkdown::render(
+            "EmmaBayesExample/BayesSoilCarbon_3Pool.Rmd",
+            output_dir = "_site",
+            output_file = "BayesSoilCarbon_3Pool.html"
           )
         shell: Rscript {0}
 
@@ -68,11 +81,29 @@ jobs:
           <html lang="en">
           <head>
             <meta charset="utf-8">
-            <meta http-equiv="refresh" content="0; url=BayesSoilCarbon_1Pool.html">
             <title>Soil Carbon Modeling Tutorials</title>
+            <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 700px; margin: 60px auto; padding: 0 20px; color: #333; }
+              h1 { color: #2c3e50; border-bottom: 2px solid #2c3e50; padding-bottom: 10px; }
+              ul { list-style: none; padding: 0; }
+              li { margin: 16px 0; }
+              a { color: #2c7fb8; text-decoration: none; font-size: 1.1em; font-weight: 500; }
+              a:hover { text-decoration: underline; }
+              .desc { color: #666; font-size: 0.95em; margin-top: 4px; }
+            </style>
           </head>
           <body>
-            <p>Redirecting to <a href="BayesSoilCarbon_1Pool.html">Bayesian Soil Carbon Tutorial</a>...</p>
+            <h1>Bayesian Soil Carbon Modeling Tutorials</h1>
+            <ul>
+              <li>
+                <a href="BayesSoilCarbon_1Pool.html">1. One-Pool Tutorial</a>
+                <div class="desc">Introduction to Bayesian inference with a simple 1-pool model. Covers priors, likelihood, MCMC, and sensitivity analysis.</div>
+              </li>
+              <li>
+                <a href="BayesSoilCarbon_3Pool.html">2. Three-Pool Tutorial</a>
+                <div class="desc">Extends the Bayesian workflow to a 3-pool series model with 6 parameters. Covers multi-pool dynamics, parameter correlations, and model comparison.</div>
+              </li>
+            </ul>
           </body>
           </html>
           HTMLEOF

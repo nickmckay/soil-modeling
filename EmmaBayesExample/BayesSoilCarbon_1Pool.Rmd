@@ -42,12 +42,17 @@ We also define a helper function that we'll reuse throughout this tutorial. It r
 
 ```{r helper-functions}
 # Run MCMC and return a tidy list of results
-run_and_summarize <- function(likelihood_fn, prior_lower, prior_upper,
+# 'prior' can be any BayesianTools prior object (uniform, truncated normal, custom).
+# If NULL, a uniform prior is created from prior_lower/prior_upper.
+run_and_summarize <- function(likelihood_fn, prior = NULL,
+                              prior_lower = NULL, prior_upper = NULL,
                               par_names = c("k", "input"),
                               iterations = 10000,
                               burn_in = 2000, thin = 5) {
 
-  prior <- createUniformPrior(lower = prior_lower, upper = prior_upper)
+  if (is.null(prior)) {
+    prior <- createUniformPrior(lower = prior_lower, upper = prior_upper)
+  }
 
   bt_setup <- createBayesianSetup(
     likelihood = likelihood_fn,
@@ -323,9 +328,22 @@ Notice the **ridge** running diagonally through the plot. This means k and input
 
 # 6. The Prior
 
-The **prior** encodes what we believe about the parameters *before* seeing the data. For this first run, we use **uniform (flat) priors** -- every value within the specified range is considered equally likely a priori.
+The **prior** encodes what we believe about the parameters *before* seeing the data.
 
-For a bulk permafrost soil profile, reasonable ranges are:
+## Types of priors
+
+There are several common choices for prior distributions:
+
+- **Uniform (flat)**: Every value within a specified range is equally likely. Simple and "non-informative" within the range, but hard boundaries at the edges. Good when you have physical bounds but little other knowledge.
+- **Gaussian (normal)**: Centered on a best guess, with a standard deviation reflecting your uncertainty. Concentrates probability near the center while still allowing values farther away. Good when you have literature values or expert knowledge.
+- **Truncated normal**: A Gaussian that is clipped to a physical range. Combines the shape of a Gaussian (concentrating probability near the center) with the hard boundaries of a uniform. Often the best choice for physical parameters that must be positive.
+- **Log-normal**: Like a Gaussian but on the log scale. Useful for parameters that must be positive and that span orders of magnitude (e.g., decomposition rates).
+
+For this first run, we use **uniform priors** -- the simplest choice. Later (Section 8), we'll experiment with Gaussian and truncated normal priors to see how prior shape affects the results.
+
+## Default uniform prior
+
+For a bulk permafrost soil profile, reasonable uniform ranges are:
 
 - **k**: 0.001 to 0.1 yr$^{-1}$ (turnover time of 10 to 1,000 years)
 - **input**: 50 to 1,000 gC/m$^2$/yr
@@ -348,13 +366,13 @@ ggplot(prior_long_default, aes(x = value)) +
   geom_histogram(aes(y = after_stat(density)), bins = 50,
                  fill = "skyblue", color = "white", alpha = 0.7) +
   facet_wrap(~ parameter, scales = "free", ncol = 2) +
-  labs(title = "Default Prior Distributions",
-       subtitle = "Uniform: every value in the range is equally likely",
+  labs(title = "Default Prior Distributions (Uniform)",
+       subtitle = "Every value in the range is equally likely",
        x = "Parameter value", y = "Density") +
   theme_minimal(base_size = 14)
 ```
 
-A uniform prior is the simplest choice, but it's not the only one. Later, we'll experiment with different priors to see how they affect the results.
+The uniform prior says "I have no idea where in this range the answer is, but I'm sure it's inside the range." This is a common starting point, but it's worth asking: do we really have *no* idea? In practice, we often know something -- a literature review, a previous experiment, an order-of-magnitude expectation. Gaussian priors let us encode that knowledge.
 
 
 # 7. Running MCMC (Default Settings)
@@ -590,7 +608,99 @@ result_wide <- run_and_summarize(
 )
 ```
 
-## 8.4 Comparing all four posteriors
+## 8.4 Gaussian (truncated normal) prior
+
+So far, every prior has been uniform -- flat within a range, zero outside. But what if we have a prior expectation from the literature? For example, suppose a meta-analysis of permafrost soils suggests $k \approx 0.02$ yr$^{-1}$ with considerable uncertainty, and carbon inputs around 300 gC/m$^2$/yr.
+
+A **truncated normal** prior encodes this: it's a Gaussian bell curve clipped to a physical range. The `BayesianTools` package provides `createTruncatedNormalPrior()` for exactly this purpose.
+
+```{r prior-gaussian}
+# Truncated normal: Gaussian shape within physical bounds
+prior_gaussian <- createTruncatedNormalPrior(
+  mean  = c(k = 0.02, input = 300),
+  sd    = c(k = 0.015, input = 200),
+  lower = c(k = 0.001, input = 50),
+  upper = c(k = 0.1,   input = 1000)
+)
+
+result_gaussian <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior         = prior_gaussian,
+  par_names     = c("k", "input"),
+  iterations    = 10000,
+  burn_in       = 2000,
+  thin          = 5
+)
+```
+
+## 8.5 Visualizing the five priors
+
+Before comparing posteriors, let's see what each prior actually looks like. For uniform priors, we can compute the density analytically. For the Gaussian (truncated normal) prior, we draw samples and plot a kernel density estimate.
+
+```{r compare-priors-viz, fig.height=6}
+# Analytical density for uniform priors
+make_uniform_density <- function(lower, upper, par_name, label, n = 500) {
+  grid <- seq(lower * 0.8, upper * 1.2, length.out = n)
+  dens <- dunif(grid, min = lower, max = upper)
+  data.frame(value = grid, density = dens, parameter = par_name, prior_type = label)
+}
+
+# Analytical density for truncated normal priors
+make_truncnorm_density <- function(mean, sd, lower, upper, par_name, label, n = 500) {
+  grid <- seq(lower * 0.8, upper * 1.2, length.out = n)
+  raw_dens <- dnorm(grid, mean = mean, sd = sd)
+  # Zero out values outside bounds, then renormalize
+  raw_dens[grid < lower | grid > upper] <- 0
+  norm_const <- pnorm(upper, mean, sd) - pnorm(lower, mean, sd)
+  dens <- ifelse(grid >= lower & grid <= upper, dnorm(grid, mean, sd) / norm_const, 0)
+  data.frame(value = grid, density = dens, parameter = par_name, prior_type = label)
+}
+
+# Uniform priors
+uniform_specs <- list(
+  list(lower = c(k = 0.001, input = 50),   upper = c(k = 0.1,  input = 1000), label = "Default (uniform)"),
+  list(lower = c(k = 0.005, input = 100),   upper = c(k = 0.03, input = 500),  label = "Narrow (uniform)"),
+  list(lower = c(k = 0.05,  input = 600),   upper = c(k = 0.10, input = 1000), label = "Offset (uniform)"),
+  list(lower = c(k = 0.0001, input = 10),   upper = c(k = 0.5,  input = 2000), label = "Very wide (uniform)")
+)
+
+all_priors <- bind_rows(lapply(uniform_specs, function(spec) {
+  bind_rows(
+    make_uniform_density(spec$lower["k"], spec$upper["k"], "k (yr^-1)", spec$label),
+    make_uniform_density(spec$lower["input"], spec$upper["input"], "input (gC/m2/yr)", spec$label)
+  )
+}))
+
+# Truncated normal prior
+gaussian_priors <- bind_rows(
+  make_truncnorm_density(0.02, 0.015, 0.001, 0.1, "k (yr^-1)", "Gaussian"),
+  make_truncnorm_density(300, 200, 50, 1000, "input (gC/m2/yr)", "Gaussian")
+)
+
+all_priors <- bind_rows(all_priors, gaussian_priors) %>%
+  mutate(prior_type = factor(prior_type,
+    levels = c("Default (uniform)", "Narrow (uniform)", "Offset (uniform)",
+               "Very wide (uniform)", "Gaussian")),
+    parameter = factor(parameter, levels = c("k (yr^-1)", "input (gC/m2/yr)")))
+
+ggplot(all_priors, aes(x = value, y = density, color = prior_type, fill = prior_type)) +
+  geom_area(alpha = 0.12, position = "identity") +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ parameter, scales = "free", ncol = 1) +
+  scale_color_manual(name = "Prior",
+    values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00")) +
+  scale_fill_manual(name = "Prior",
+    values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00")) +
+  labs(title = "Prior Distributions for Each Experiment",
+       subtitle = "Four uniform priors (flat) and one Gaussian (bell-shaped)",
+       x = "Parameter value", y = "Density") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+Notice the Gaussian prior (orange) has a fundamentally different shape from the uniform priors -- it concentrates probability near its center ($k = 0.02$, input $= 300$) while still allowing a wide range. This is qualitatively different from simply narrowing a uniform prior's bounds.
+
+## 8.6 Comparing all five posteriors
 
 ```{r compare-priors, fig.height=7}
 # Combine posteriors from all runs
@@ -603,20 +713,23 @@ label_posterior <- function(df, label) {
 }
 
 all_posteriors <- bind_rows(
-  label_posterior(result_default$posterior_df, "Default"),
-  label_posterior(result_narrow$posterior_df,  "Narrow"),
-  label_posterior(result_offset$posterior_df,  "Offset"),
-  label_posterior(result_wide$posterior_df,    "Very wide")
+  label_posterior(result_default$posterior_df,  "Default (uniform)"),
+  label_posterior(result_narrow$posterior_df,   "Narrow (uniform)"),
+  label_posterior(result_offset$posterior_df,   "Offset (uniform)"),
+  label_posterior(result_wide$posterior_df,     "Very wide (uniform)"),
+  label_posterior(result_gaussian$posterior_df, "Gaussian")
 ) %>%
   mutate(prior_type = factor(prior_type,
-                             levels = c("Default", "Narrow", "Offset", "Very wide")))
+    levels = c("Default (uniform)", "Narrow (uniform)", "Offset (uniform)",
+               "Very wide (uniform)", "Gaussian")))
 
 ggplot(all_posteriors, aes(x = value, fill = prior_type)) +
-  geom_density(alpha = 0.4, linewidth = 0.6) +
+  geom_density(alpha = 0.35, linewidth = 0.5) +
   facet_wrap(~ parameter, scales = "free", ncol = 1) +
-  scale_fill_brewer(palette = "Set1", name = "Prior") +
+  scale_fill_manual(name = "Prior",
+    values = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00")) +
   labs(title = "Effect of Prior Choice on the Posterior",
-       subtitle = "Same data and likelihood, different priors",
+       subtitle = "Same data and likelihood, different priors (including Gaussian)",
        x = "Parameter value", y = "Density") +
   theme_minimal(base_size = 14) +
   theme(legend.position = "top")
@@ -624,9 +737,12 @@ ggplot(all_posteriors, aes(x = value, fill = prior_type)) +
 
 **What to notice:**
 
-- **Default and Very wide** give similar posteriors -- when the data are informative, the prior doesn't matter much as long as it covers the high-likelihood region.
+- **Default, Very wide, and Gaussian** give similar posteriors -- when the data are informative and the prior covers the high-likelihood region, prior shape doesn't matter much. The Gaussian and default uniform posteriors nearly overlap, showing that the data are driving the result.
 - **Narrow** gives a slightly tighter posterior because the prior itself excludes some parameter combinations that the data would otherwise allow.
-- **Offset** is the cautionary tale: when the prior completely excludes the region the data favor, the posterior piles up at the prior boundary. The MCMC can't go where the prior says "impossible," no matter how much the data want it there. This illustrates **prior dominance** -- in real applications, always check that your prior is broad enough to not exclude plausible values.
+- **Offset** is the cautionary tale: when the prior completely excludes the region the data favor, the posterior piles up at the prior boundary. The MCMC can't go where the prior says "impossible," no matter how much the data want it there.
+- **Gaussian vs. uniform**: The Gaussian prior may produce a slightly tighter posterior than the default uniform, because it gently down-weights extreme values rather than treating them as equally likely. But when the data are strong, the difference is subtle. The Gaussian prior would matter much more with weaker or fewer data points.
+
+The key lesson: **prior shape matters less than prior coverage**. A uniform and a Gaussian with similar coverage produce similar posteriors. But a prior that *excludes* the truth (like Offset) is catastrophic regardless of its shape.
 
 
 # 9. Experiment: Effect of MCMC Settings
@@ -760,11 +876,11 @@ The key lesson: always inspect your trace plots and check convergence before tru
 
 ## Where to go next
 
-- **3-pool model**: The companion script `BayesSoilCarbon_Tutorial.R` extends this analysis to a 3-pool series model with 6 parameters. You'll see how more parameters create new challenges: wider posteriors, stronger correlations, and harder convergence.
+- **3-pool model**: The [companion tutorial](BayesSoilCarbon_3Pool.html) extends this analysis to a 3-pool series model with 6 parameters. You'll see how more parameters create new challenges: wider posteriors, stronger correlations, and harder convergence.
 
 - **Try different data**: The `datComb` table also contains a "Warming" treatment. What happens to decomposition rates under experimental warming?
 
-- **Informative priors**: Instead of uniform priors, try using literature values to construct Gaussian priors. How does this change the posterior compared to flat priors?
+- **Stronger informative priors**: We tried a Gaussian prior in Section 8.4 and saw that it gave similar results to the uniform when the data were strong. What happens with a *very* tight Gaussian prior (small SD)? Or a log-normal prior for $k$?
 
 - **Model comparison**: Could you compare the 1-pool model to a 2-pool or 3-pool model using Bayesian model selection (e.g., DIC or Bayes factors)?
 

@@ -1,0 +1,976 @@
+---
+title: "Bayesian Soil Carbon Modeling: A 3-Pool Tutorial"
+author: "Soil Carbon Modeling Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+# 1. Setup & Recap
+
+This tutorial extends the [1-pool Bayesian tutorial](BayesSoilCarbon_1Pool.html) to a 3-pool series model. If you haven't gone through the 1-pool tutorial yet, start there -- it introduces Bayesian inference, likelihood functions, priors, and MCMC from scratch.
+
+In the 1-pool tutorial, we learned that:
+
+- **Two parameters** (decomposition rate `k` and carbon input) control the model
+- **Two data points** (bulk C stock and bulk $\Delta^{14}$C at 2022) constrain those parameters
+- The posterior was fairly tight because 2 parameters vs. 2 data points is a well-determined problem
+
+Now we move to 6 parameters and 6 data points. The problem is formally just as determined, but the parameter space is much harder to explore and the parameters can trade off against each other in complex ways.
+
+```{r load-libraries}
+library(SoilR)
+library(BayesianTools)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+set.seed(42)
+
+load("soilRmcmc.RData")
+```
+
+We reuse the same `run_and_summarize` helper from the 1-pool tutorial, extended to handle any number of parameters.
+
+```{r helper-functions}
+# 'prior' can be any BayesianTools prior object (uniform, truncated normal, custom).
+# If NULL, a uniform prior is created from prior_lower/prior_upper.
+run_and_summarize <- function(likelihood_fn, prior = NULL,
+                              prior_lower = NULL, prior_upper = NULL,
+                              par_names,
+                              iterations = 20000,
+                              burn_in = 5000, thin = 10) {
+
+  if (is.null(prior)) {
+    prior <- createUniformPrior(lower = prior_lower, upper = prior_upper)
+  }
+
+  bt_setup <- createBayesianSetup(
+    likelihood = likelihood_fn,
+    prior      = prior,
+    names      = par_names
+  )
+
+  mcmc_out <- runMCMC(
+    bayesianSetup = bt_setup,
+    sampler       = "DREAMzs",
+    settings      = list(iterations = iterations, message = FALSE)
+  )
+
+  raw_chains <- getSample(mcmc_out, start = 1, coda = TRUE)
+  chain_df <- do.call(rbind, lapply(seq_along(raw_chains), function(i) {
+    ch <- as.data.frame(as.matrix(raw_chains[[i]]))
+    colnames(ch) <- par_names
+    ch$iteration <- seq_len(nrow(ch))
+    ch$chain <- factor(i)
+    ch
+  }))
+
+  samples <- getSample(mcmc_out, start = burn_in, thin = thin)
+  colnames(samples) <- par_names
+  posterior_df <- as.data.frame(samples)
+
+  map_est <- MAP(mcmc_out, start = burn_in)$parametersMAP
+  names(map_est) <- par_names
+
+  summary_tbl <- posterior_df %>%
+    pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+    group_by(parameter) %>%
+    summarise(
+      median   = median(value),
+      lower_90 = quantile(value, 0.05),
+      upper_90 = quantile(value, 0.95),
+      .groups  = "drop"
+    )
+
+  list(
+    mcmc_out     = mcmc_out,
+    chain_df     = chain_df,
+    posterior_df = posterior_df,
+    map          = map_est,
+    summary      = summary_tbl,
+    burn_in      = burn_in,
+    thin         = thin
+  )
+}
+```
+
+
+# 2. Why a 3-Pool Model?
+
+The CiPEHR soil profile has three distinct layers: **surface organic**, **deep organic**, and **mineral**. These layers have very different properties -- the surface is fresh, carbon-rich litter that decomposes quickly, while the mineral layer is old, stabilized carbon that turns over on centennial timescales.
+
+When we aggregated everything into a single pool in the 1-pool tutorial, we lost this structure. The bulk $\Delta^{14}$C is a weighted average that hides how the bomb spike propagates differently through each layer.
+
+Let's look at the per-layer data.
+
+```{r show-layer-data}
+dat_layers <- datComb %>%
+  filter(year == 2009 | treatment == "Control") %>%
+  mutate(layer_label = factor(layer,
+    levels = c("so", "do", "min"),
+    labels = c("Surface organic", "Deep organic", "Mineral")))
+
+knitr::kable(
+  dat_layers %>%
+    select(year, layer_label, C_stock, C_stock_sd, C14, C_14_sd) %>%
+    arrange(year, layer_label),
+  digits = 1,
+  col.names = c("Year", "Layer", "C stock (kg/m2)", "C stock SD",
+                "Delta14C", "Delta14C SD"),
+  caption = "Per-layer soil observations from CiPEHR"
+)
+```
+
+```{r plot-layer-data, fig.height=4}
+p_layer_c14 <- ggplot(dat_layers, aes(x = year, y = C14,
+                                       color = layer_label, shape = layer_label)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = C14 - C_14_sd, ymax = C14 + C_14_sd), width = 0.3) +
+  geom_line(linewidth = 0.8) +
+  labs(title = expression(paste(Delta^14, "C by Soil Layer")),
+       x = "Year", y = expression(paste(Delta^14, "C (per mil)")),
+       color = NULL, shape = NULL) +
+  scale_color_manual(values = c("coral", "steelblue", "forestgreen")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+p_layer_cstock <- ggplot(dat_layers, aes(x = year, y = C_stock,
+                                          color = layer_label, shape = layer_label)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = C_stock - C_stock_sd, ymax = C_stock + C_stock_sd),
+                width = 0.3) +
+  geom_line(linewidth = 0.8) +
+  labs(title = "Carbon Stock by Soil Layer",
+       x = "Year", y = expression(paste("C stock (kg m"^-2, ")")),
+       color = NULL, shape = NULL) +
+  scale_color_manual(values = c("coral", "steelblue", "forestgreen")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+p_layer_c14 + p_layer_cstock
+```
+
+Notice how the layers differ:
+
+- **Surface organic** has the highest $\Delta^{14}$C -- it has incorporated the most bomb $^{14}$C because it cycles fastest.
+- **Mineral** has the lowest $\Delta^{14}$C -- it cycles so slowly that the bomb spike has barely arrived.
+- **Deep organic** falls in between.
+
+A 1-pool model can't capture these differences. The 3-pool model treats each layer as a separate compartment, connected in series:
+
+$$\text{Atmosphere} \xrightarrow{\text{input}} \text{Surface organic} \xrightarrow{a_{21}} \text{Deep organic} \xrightarrow{a_{32}} \text{Mineral}$$
+
+
+# 3. The 3-Pool Series Model
+
+## Parameters
+
+The 3-pool series model has **6 parameters**:
+
+| Parameter | Description | Units |
+|-----------|-------------|-------|
+| `k1` | Decomposition rate, surface organic | yr$^{-1}$ |
+| `k2` | Decomposition rate, deep organic | yr$^{-1}$ |
+| `k3` | Decomposition rate, mineral | yr$^{-1}$ |
+| `input` | Carbon input rate to surface pool | gC/m$^2$/yr |
+| `a21` | Transfer rate, surface $\to$ deep | yr$^{-1}$ |
+| `a32` | Transfer rate, deep $\to$ mineral | yr$^{-1}$ |
+
+## The compartmental matrix
+
+The model follows the same structure as the 1-pool model -- $dC/dt = I + A \cdot C$ -- but now $C$ is a 3-element vector and $A$ is a $3 \times 3$ **compartmental matrix**:
+
+$$A = \begin{pmatrix} -k_1 & 0 & 0 \\ a_{21} & -k_2 & 0 \\ 0 & a_{32} & -k_3 \end{pmatrix}$$
+
+Each diagonal entry $-k_i$ is the total loss rate from pool $i$ (decomposition + transfer out). The off-diagonal entries $a_{21}$ and $a_{32}$ route carbon downward. This is a "series" topology -- no carbon moves back up.
+
+For this to be physically valid, the transfer rates must be smaller than the decomposition rates: $a_{21} < k_1$ and $a_{32} < k_2$. Otherwise, more carbon would leave a pool through transfer than through decomposition, which doesn't make physical sense.
+
+## Forward model demo
+
+Let's run the model at a few hand-picked parameter sets to build intuition.
+
+```{r prepare-3pool-data}
+dat_3pool <- datComb %>%
+  filter(year == 2009 | treatment == "Control") %>%
+  mutate(C_stock    = C_stock * 1000,
+         C_stock_sd = C_stock_sd * 1000)
+
+init_3pool  <- dat_3pool %>% filter(year == 2009)
+final_3pool <- dat_3pool %>% filter(year == 2022)
+
+C0_3pool <- init_3pool$C_stock
+F0_3pool <- init_3pool$C14
+years_3pool <- seq(2009, 2022)
+
+pool_labels <- c(so = "Surface organic", do = "Deep organic", min = "Mineral")
+```
+
+```{r forward-demo, fig.height=7}
+years_plot <- seq(2009, 2022, by = 0.5)
+
+demo_params <- list(
+  list(ks = c(0.1, 0.01, 0.005), input = 100, a21 = 0.05, a32 = 0.005,
+       label = "Fast surface"),
+  list(ks = c(0.02, 0.01, 0.005), input = 50, a21 = 0.01, a32 = 0.002,
+       label = "Slow surface"),
+  list(ks = c(0.05, 0.02, 0.01), input = 80, a21 = 0.02, a32 = 0.01,
+       label = "High transfer")
+)
+
+demo_runs <- bind_rows(lapply(demo_params, function(dp) {
+  m <- tryCatch(
+    ThreepSeriesModel14(
+      t = years_plot,
+      ks = setNames(dp$ks, c("k1", "k2", "k3")),
+      C0 = C0_3pool, F0_Delta14C = F0_3pool,
+      In = dp$input, a21 = dp$a21, a32 = dp$a32,
+      inputFc = atmIn, pass = TRUE
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(m)) return(NULL)
+  data.frame(
+    year = rep(years_plot, 3),
+    pool = rep(pool_labels, each = length(years_plot)),
+    C14     = as.vector(getF14(m)),
+    C_stock = as.vector(getC(m)),
+    scenario = dp$label
+  )
+}))
+
+demo_runs$pool <- factor(demo_runs$pool, levels = pool_labels)
+
+obs_plot <- dat_3pool %>%
+  mutate(pool = factor(pool_labels[layer], levels = pool_labels))
+
+p_demo_c14 <- ggplot(demo_runs, aes(x = year, y = C14, color = scenario)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = obs_plot, aes(x = year, y = C14),
+             inherit.aes = FALSE, size = 3) +
+  geom_errorbar(data = obs_plot,
+                aes(x = year, ymin = C14 - C_14_sd, ymax = C14 + C_14_sd),
+                inherit.aes = FALSE, width = 0.3) +
+  facet_wrap(~ pool, ncol = 1, scales = "free_y") +
+  labs(title = expression(paste("Forward model demo: ", Delta^14, "C")),
+       x = "Year", y = expression(paste(Delta^14, "C (per mil)")),
+       color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+p_demo_cstock <- ggplot(demo_runs, aes(x = year, y = C_stock / 1000, color = scenario)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = obs_plot, aes(x = year, y = C_stock / 1000),
+             inherit.aes = FALSE, size = 3) +
+  geom_errorbar(data = obs_plot,
+                aes(x = year, ymin = (C_stock - C_stock_sd) / 1000,
+                    ymax = (C_stock + C_stock_sd) / 1000),
+                inherit.aes = FALSE, width = 0.3) +
+  facet_wrap(~ pool, ncol = 1, scales = "free_y") +
+  labs(title = "Forward model demo: Carbon stock",
+       x = "Year", y = expression(paste("C stock (kg m"^-2, ")")),
+       color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+p_demo_c14 + p_demo_cstock
+```
+
+None of these hand-picked parameter sets perfectly match the observations in all three layers simultaneously. That's the challenge -- and exactly why we need MCMC to explore the 6-dimensional parameter space.
+
+
+# 4. The 3-Pool Likelihood
+
+The likelihood has the same Gaussian structure as the 1-pool version, but now we compare predictions to observations in **each of the 3 pools separately**. That gives us 6 data points: 3 carbon stocks and 3 $\Delta^{14}$C values at 2022.
+
+One important difference: we multiply the reported measurement uncertainty by a factor of **0.4**. This is an empirical scaling factor from the original analysis that accounts for model structural error -- the fact that the model is a simplified representation of reality. Without this scaling, the likelihood would be too forgiving and the posteriors too wide.
+
+```{r define-likelihood}
+likelihood_3pool <- function(pars) {
+  k1 <- pars[1]; k2 <- pars[2]; k3 <- pars[3]
+  input <- pars[4]; a21 <- pars[5]; a32 <- pars[6]
+
+  model <- tryCatch(
+    ThreepSeriesModel14(
+      t = years_3pool,
+      ks = c(k1 = k1, k2 = k2, k3 = k3),
+      C0 = C0_3pool,
+      F0_Delta14C = F0_3pool,
+      In = input,
+      a21 = a21,
+      a32 = a32,
+      inputFc = atmIn,
+      pass = TRUE
+    ),
+    error = function(e) return(NULL)
+  )
+
+  if (is.null(model)) return(-1e10)
+
+  idx <- length(years_3pool)
+  pred_C14    <- getF14(model)[idx, ]
+  pred_Cstock <- getC(model)[idx, ]
+
+  ll_C14    <- sum(dnorm(pred_C14 - final_3pool$C14, 0,
+                         final_3pool$C_14_sd * 0.4, log = TRUE))
+  ll_Cstock <- sum(dnorm(pred_Cstock - final_3pool$C_stock, 0,
+                         final_3pool$C_stock_sd * 0.4, log = TRUE))
+
+  return(sum(ll_C14, ll_Cstock, na.rm = TRUE))
+}
+
+cat("Test likelihood at example parameters:",
+    likelihood_3pool(c(0.1, 0.01, 0.01, 200, 0.1, 0.01)))
+```
+
+Unlike the 1-pool model, we can't easily visualize a 6-dimensional likelihood surface. We have to trust the MCMC sampler to explore it for us. This is where good priors and sufficient iterations become critical.
+
+
+# 5. Priors
+
+## Choosing prior distributions
+
+As we discussed in the [1-pool tutorial](BayesSoilCarbon_1Pool.html), the prior encodes what we believe *before* seeing the data. With 6 parameters, prior choice matters even more -- too wide and the MCMC wastes time in impossible regions; too narrow and you might miss the answer.
+
+We have two broad options:
+
+- **Uniform (flat)**: Equal probability across a range. Simple, but treats all values as equally likely.
+- **Truncated normal (Gaussian)**: Centered on a best guess with a bell-curve shape, clipped to physical bounds. Encodes the idea that some values are more plausible than others.
+
+We'll start with uniform priors and then compare to truncated normal priors in Section 9.
+
+The key physical constraints for both prior types:
+
+- Surface organic decomposes fastest ($k_1$ is largest)
+- Mineral soil decomposes slowest ($k_3$ is smallest)
+- Transfer rates must be smaller than decomposition rates ($a_{21} < k_1$, $a_{32} < k_2$)
+
+## Uniform priors
+
+```{r define-priors}
+par_names <- c("k1", "k2", "k3", "input", "a21", "a32")
+
+prior_lower <- c(k1 = 0.002,  k2 = 0.0006, k3 = 0.0002,
+                 input = 10,   a21 = 0.0025, a32 = 0.0001)
+prior_upper <- c(k1 = 0.2,    k2 = 0.06,   k3 = 0.06,
+                 input = 205,  a21 = 0.5,    a32 = 0.1)
+
+prior_range_df <- data.frame(
+  Parameter = par_names,
+  Lower = prior_lower,
+  Upper = prior_upper,
+  Interpretation = c(
+    "Turnover 5-500 yr",
+    "Turnover 17-1667 yr",
+    "Turnover 17-5000 yr",
+    "Litter input to surface pool",
+    "Surface to deep transfer",
+    "Deep to mineral transfer"
+  )
+)
+knitr::kable(prior_range_df, digits = 4,
+             caption = "Uniform prior ranges for the 3-pool model")
+```
+
+## Gaussian (truncated normal) priors
+
+Suppose a literature review suggests approximate values for each parameter. We can encode this as truncated normal priors -- Gaussian bell curves centered on the literature values, clipped to the same physical bounds as the uniform priors.
+
+```{r define-gaussian-priors}
+# Literature-informed centers and uncertainties
+prior_means <- c(k1 = 0.05,  k2 = 0.015,  k3 = 0.005,
+                 input = 80,  a21 = 0.03,   a32 = 0.01)
+prior_sds   <- c(k1 = 0.04,  k2 = 0.015,  k3 = 0.01,
+                 input = 60,  a21 = 0.05,   a32 = 0.02)
+
+prior_gaussian <- createTruncatedNormalPrior(
+  mean  = prior_means,
+  sd    = prior_sds,
+  lower = prior_lower,
+  upper = prior_upper
+)
+
+gaussian_range_df <- data.frame(
+  Parameter = par_names,
+  Mean = prior_means,
+  SD = prior_sds,
+  Lower = prior_lower,
+  Upper = prior_upper
+)
+knitr::kable(gaussian_range_df, digits = 4,
+             caption = "Truncated normal prior parameters (same bounds as uniform)")
+```
+
+## Comparing prior shapes
+
+```{r plot-priors, fig.height=6}
+# Uniform prior samples
+prior_samples_unif <- as.data.frame(mapply(
+  runif, n = 10000, min = prior_lower, max = prior_upper
+))
+
+# Truncated normal prior samples
+prior_samples_gauss <- as.data.frame(mapply(function(mu, s, lo, hi) {
+  # Rejection sampling from truncated normal
+  out <- numeric(10000)
+  filled <- 0
+  while (filled < 10000) {
+    candidates <- rnorm(20000, mu, s)
+    valid <- candidates[candidates >= lo & candidates <= hi]
+    n_take <- min(length(valid), 10000 - filled)
+    out[(filled + 1):(filled + n_take)] <- valid[1:n_take]
+    filled <- filled + n_take
+  }
+  out
+}, mu = prior_means, s = prior_sds, lo = prior_lower, hi = prior_upper))
+colnames(prior_samples_gauss) <- par_names
+
+prior_long_unif <- prior_samples_unif %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = par_names),
+         prior_type = "Uniform")
+
+prior_long_gauss <- prior_samples_gauss %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = par_names),
+         prior_type = "Gaussian")
+
+prior_long <- bind_rows(prior_long_unif, prior_long_gauss)
+
+ggplot(prior_long, aes(x = value, fill = prior_type)) +
+  geom_density(alpha = 0.4, linewidth = 0.6) +
+  facet_wrap(~ parameter, scales = "free", ncol = 3) +
+  scale_fill_manual(values = c("Gaussian" = "coral", "Uniform" = "skyblue"),
+                    name = "Prior type") +
+  labs(title = "Uniform vs. Gaussian (Truncated Normal) Priors",
+       subtitle = "Same physical bounds, but Gaussian concentrates probability near the center",
+       x = "Parameter value", y = "Density") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+The Gaussian priors have the same physical bounds as the uniform priors, but they concentrate probability near the literature-informed centers. For well-constrained parameters (like $k_1$), this may not matter much -- the data will drive the posterior regardless. For weakly constrained parameters (like $k_3$ or $a_{32}$), the prior shape can make a real difference.
+
+
+# 6. Running MCMC
+
+With 6 parameters, we need more iterations than the 1-pool model. We use 20,000 iterations with DREAMzs. For a teaching example this is sufficient; a publication-quality analysis might use 100,000+.
+
+```{r run-mcmc}
+result <- run_and_summarize(
+  likelihood_fn = likelihood_3pool,
+  prior_lower   = prior_lower,
+  prior_upper   = prior_upper,
+  par_names     = par_names,
+  iterations    = 20000,
+  burn_in       = 5000,
+  thin          = 10
+)
+
+cat("Retained", nrow(result$posterior_df), "posterior samples")
+```
+
+## Trace plots
+
+With 6 parameters, we need a bigger panel. Look for the same "hairy caterpillar" pattern in each -- well-mixed chains bouncing around a stable region.
+
+```{r trace-plots, fig.height=8}
+chain_long <- result$chain_df %>%
+  pivot_longer(cols = all_of(par_names),
+               names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = par_names))
+
+ggplot(chain_long, aes(x = iteration, y = value, color = chain)) +
+  geom_line(alpha = 0.4, linewidth = 0.3) +
+  facet_wrap(~ parameter, scales = "free_y", ncol = 3) +
+  labs(title = "MCMC Trace Plots (3-Pool Model)",
+       subtitle = "Look for mixing and convergence across all chains",
+       x = "Iteration", y = "Value") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+Some parameters (like `k3` or `a32` for the slow mineral pool) may show worse mixing than others. This is typical -- slow pools have weak 14C signals, so the data provide less constraint and the chains wander more.
+
+## Burn-in and thinning
+
+We use a burn-in of 5,000 (vs. 2,000 for the 1-pool model) because the chains need more time to settle in a 6D space. Thinning of 10 reduces autocorrelation.
+
+```{r burnin-visual, fig.height=8}
+ggplot(chain_long, aes(x = iteration, y = value, color = chain)) +
+  geom_line(alpha = 0.4, linewidth = 0.3) +
+  geom_vline(xintercept = result$burn_in / 3, color = "black",
+             linewidth = 1, linetype = "dotted") +
+  annotate("text", x = result$burn_in / 3, y = Inf,
+           label = " Burn-in cutoff", hjust = 0, vjust = 1.5, size = 3.5) +
+  facet_wrap(~ parameter, scales = "free_y", ncol = 3) +
+  labs(title = "Burn-in Removal",
+       subtitle = "Everything left of the dotted line is discarded",
+       x = "Iteration", y = "Value") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+
+# 7. Results
+
+## Prior vs. posterior
+
+The key question: how much did the data narrow down our estimates for each parameter?
+
+```{r prior-vs-posterior, fig.height=6}
+posterior_long <- result$posterior_df %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = par_names))
+
+ggplot() +
+  geom_histogram(data = prior_long_unif,
+                 aes(x = value, y = after_stat(density)),
+                 bins = 40, fill = "skyblue", alpha = 0.4, color = "white") +
+  geom_density(data = posterior_long, aes(x = value),
+               fill = "coral", alpha = 0.5, linewidth = 0.8) +
+  geom_vline(data = data.frame(
+    parameter = factor(par_names, levels = par_names),
+    xval = result$map),
+    aes(xintercept = xval), linetype = "dashed", color = "darkblue") +
+  facet_wrap(~ parameter, scales = "free", ncol = 3) +
+  labs(title = "Prior (blue) vs. Posterior (coral)",
+       subtitle = "Dashed blue = MAP estimate. Narrow posteriors = well-constrained parameters.",
+       x = "Parameter value", y = "Density") +
+  theme_minimal(base_size = 12)
+```
+
+## MAP estimates and credible intervals
+
+```{r summary-table}
+# Compute uncertainty reduction
+summary_with_reduction <- result$summary %>%
+  mutate(
+    prior_range = prior_upper[parameter] - prior_lower[parameter],
+    post_range  = upper_90 - lower_90,
+    uncert_reduction = round(100 * (1 - post_range / prior_range), 1)
+  )
+
+cat("=== 3-Pool Posterior Summary ===\n")
+cat(sprintf("%-8s  %8s  %10s  %10s  %10s  %s\n",
+            "Param", "MAP", "Median", "90% lo", "90% hi", "Reduction"))
+for (i in seq_len(nrow(summary_with_reduction))) {
+  r <- summary_with_reduction[i, ]
+  cat(sprintf("%-8s  %8.4f  %10.4f  %10.4f  %10.4f  %5.1f%%\n",
+              r$parameter, result$map[r$parameter], r$median,
+              r$lower_90, r$upper_90, r$uncert_reduction))
+}
+```
+
+## Derived quantities: turnover times
+
+The turnover time $\tau = 1/k$ tells us how long carbon resides in each pool on average. This is often more intuitive than the decomposition rate.
+
+```{r turnover-times}
+k_params <- c("k1", "k2", "k3")
+turnover_df <- result$posterior_df[, k_params] %>%
+  mutate(across(everything(), ~ 1 / .x)) %>%
+  rename(tau1 = k1, tau2 = k2, tau3 = k3) %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  mutate(pool = factor(parameter,
+    levels = c("tau1", "tau2", "tau3"),
+    labels = c("Surface organic", "Deep organic", "Mineral")))
+
+turnover_summary <- turnover_df %>%
+  group_by(pool) %>%
+  summarise(
+    median = median(value),
+    lower_90 = quantile(value, 0.05),
+    upper_90 = quantile(value, 0.95),
+    .groups = "drop"
+  )
+
+knitr::kable(turnover_summary, digits = 1,
+             col.names = c("Pool", "Median (yr)", "90% lo", "90% hi"),
+             caption = "Posterior turnover times (1/k)")
+```
+
+## Posterior correlations
+
+In multi-parameter models, parameters often **trade off** against each other. For example, a higher decomposition rate might be compensated by higher carbon input. These correlations are a key feature of the posterior that single-parameter summaries miss.
+
+```{r correlation-matrix, fig.height=5}
+cor_mat <- cor(result$posterior_df)
+
+cat("--- Posterior Correlation Matrix ---\n")
+print(round(cor_mat, 2))
+```
+
+```{r pairs-plot, fig.height=7}
+n_pairs <- min(500, nrow(result$posterior_df))
+pairs(result$posterior_df[sample(nrow(result$posterior_df), n_pairs), ],
+      pch = 16, cex = 0.4, col = adjustcolor("steelblue", 0.3),
+      main = "Posterior Pairwise Correlations (3-Pool Model)")
+```
+
+Look for elliptical clouds tilted at an angle -- these indicate correlated parameters. Strong correlations mean the data can't independently constrain those parameters; only certain *combinations* are well determined.
+
+
+# 8. Model Predictions
+
+We run the forward model at the MAP estimate (best fit) and at 200 random posterior draws (uncertainty envelope), showing predictions for each soil layer separately.
+
+```{r predictions, fig.height=8}
+years_plot <- seq(2009, 2022, by = 0.5)
+
+# MAP prediction
+map_model <- ThreepSeriesModel14(
+  t = years_plot,
+  ks = c(k1 = result$map["k1"], k2 = result$map["k2"], k3 = result$map["k3"]),
+  C0 = C0_3pool, F0_Delta14C = F0_3pool,
+  In = result$map["input"], a21 = result$map["a21"], a32 = result$map["a32"],
+  inputFc = atmIn, pass = TRUE
+)
+
+map_pred <- data.frame(
+  year = rep(years_plot, 3),
+  pool = rep(pool_labels, each = length(years_plot)),
+  C14     = as.vector(getF14(map_model)),
+  C_stock = as.vector(getC(map_model))
+)
+
+# Posterior ensemble
+n_draws <- min(200, nrow(result$posterior_df))
+draw_idx <- sample(nrow(result$posterior_df), n_draws)
+
+ensemble <- bind_rows(lapply(draw_idx, function(i) {
+  p <- as.numeric(result$posterior_df[i, ])
+  m <- tryCatch(
+    ThreepSeriesModel14(
+      t = years_plot,
+      ks = c(k1 = p[1], k2 = p[2], k3 = p[3]),
+      C0 = C0_3pool, F0_Delta14C = F0_3pool,
+      In = p[4], a21 = p[5], a32 = p[6],
+      inputFc = atmIn, pass = TRUE
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(m)) return(NULL)
+  data.frame(
+    year = rep(years_plot, 3),
+    pool = rep(pool_labels, each = length(years_plot)),
+    C14     = as.vector(getF14(m)),
+    C_stock = as.vector(getC(m))
+  )
+}))
+
+envelope <- ensemble %>%
+  group_by(year, pool) %>%
+  summarise(
+    C14_lo = quantile(C14, 0.05), C14_hi = quantile(C14, 0.95),
+    Cstock_lo = quantile(C_stock, 0.05), Cstock_hi = quantile(C_stock, 0.95),
+    .groups = "drop"
+  )
+
+obs_plot <- dat_3pool %>%
+  mutate(pool = factor(pool_labels[layer], levels = pool_labels))
+
+map_pred$pool  <- factor(map_pred$pool, levels = pool_labels)
+envelope$pool  <- factor(envelope$pool, levels = pool_labels)
+
+# Delta14C by layer
+p_c14 <- ggplot() +
+  geom_ribbon(data = envelope,
+              aes(x = year, ymin = C14_lo, ymax = C14_hi),
+              fill = "steelblue", alpha = 0.3) +
+  geom_line(data = map_pred, aes(x = year, y = C14),
+            color = "steelblue", linewidth = 1) +
+  geom_point(data = obs_plot, aes(x = year, y = C14), size = 3) +
+  geom_errorbar(data = obs_plot,
+                aes(x = year, ymin = C14 - C_14_sd, ymax = C14 + C_14_sd),
+                width = 0.3) +
+  facet_wrap(~ pool, ncol = 1, scales = "free_y") +
+  labs(title = expression(paste(Delta^14, "C by Soil Layer")),
+       subtitle = "MAP prediction + 90% posterior envelope vs. observations",
+       x = "Year", y = expression(paste(Delta^14, "C (per mil)"))) +
+  theme_minimal(base_size = 12)
+
+# C stock by layer
+p_cstock <- ggplot() +
+  geom_ribbon(data = envelope,
+              aes(x = year, ymin = Cstock_lo / 1000, ymax = Cstock_hi / 1000),
+              fill = "forestgreen", alpha = 0.3) +
+  geom_line(data = map_pred, aes(x = year, y = C_stock / 1000),
+            color = "forestgreen", linewidth = 1) +
+  geom_point(data = obs_plot, aes(x = year, y = C_stock / 1000), size = 3) +
+  geom_errorbar(data = obs_plot,
+                aes(x = year, ymin = (C_stock - C_stock_sd) / 1000,
+                    ymax = (C_stock + C_stock_sd) / 1000),
+                width = 0.3) +
+  facet_wrap(~ pool, ncol = 1, scales = "free_y") +
+  labs(title = "Carbon Stock by Soil Layer",
+       subtitle = "MAP prediction + 90% posterior envelope vs. observations",
+       x = "Year", y = expression(paste("C stock (kg m"^-2, ")"))) +
+  theme_minimal(base_size = 12)
+
+p_c14 + p_cstock
+```
+
+
+# 9. Experiment: Uniform vs. Gaussian Priors
+
+Does prior shape matter for the 3-pool model? Let's re-run the MCMC with the truncated normal priors from Section 5 and compare the posteriors.
+
+```{r run-gaussian-mcmc}
+result_gauss <- run_and_summarize(
+  likelihood_fn = likelihood_3pool,
+  prior         = prior_gaussian,
+  par_names     = par_names,
+  iterations    = 20000,
+  burn_in       = 5000,
+  thin          = 10
+)
+
+cat("Retained", nrow(result_gauss$posterior_df), "posterior samples (Gaussian prior)")
+```
+
+## Comparing posteriors
+
+```{r compare-prior-types, fig.height=7}
+posterior_long_unif <- result$posterior_df %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = par_names),
+         prior_type = "Uniform")
+
+posterior_long_gauss <- result_gauss$posterior_df %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = par_names),
+         prior_type = "Gaussian")
+
+posteriors_compare <- bind_rows(posterior_long_unif, posterior_long_gauss)
+
+ggplot(posteriors_compare, aes(x = value, fill = prior_type)) +
+  geom_density(alpha = 0.4, linewidth = 0.6) +
+  facet_wrap(~ parameter, scales = "free", ncol = 3) +
+  scale_fill_manual(values = c("Gaussian" = "coral", "Uniform" = "steelblue"),
+                    name = "Prior type") +
+  labs(title = "Posterior Comparison: Uniform vs. Gaussian Priors",
+       subtitle = "Same likelihood and data, different prior shapes",
+       x = "Parameter value", y = "Density") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+## Summary comparison
+
+```{r prior-type-summary}
+summary_gauss <- result_gauss$summary %>%
+  mutate(
+    prior_range = prior_upper[parameter] - prior_lower[parameter],
+    post_range  = upper_90 - lower_90,
+    uncert_reduction = round(100 * (1 - post_range / prior_range), 1)
+  )
+
+cat("=== Uniform Prior: Posterior Summary ===\n")
+cat(sprintf("%-8s  %10s  %10s  %10s\n", "Param", "Median", "90% lo", "90% hi"))
+for (i in seq_len(nrow(summary_with_reduction))) {
+  r <- summary_with_reduction[i, ]
+  cat(sprintf("%-8s  %10.4f  %10.4f  %10.4f\n",
+              r$parameter, r$median, r$lower_90, r$upper_90))
+}
+
+cat("\n=== Gaussian Prior: Posterior Summary ===\n")
+cat(sprintf("%-8s  %10s  %10s  %10s\n", "Param", "Median", "90% lo", "90% hi"))
+for (i in seq_len(nrow(summary_gauss))) {
+  r <- summary_gauss[i, ]
+  cat(sprintf("%-8s  %10.4f  %10.4f  %10.4f\n",
+              r$parameter, r$median, r$lower_90, r$upper_90))
+}
+```
+
+**What to notice:**
+
+- For **well-constrained parameters** (those where the uniform posterior was already narrow relative to the prior), the Gaussian prior makes little difference. The data are strong enough to override the prior shape.
+- For **weakly constrained parameters** (where the uniform posterior filled much of the prior range), the Gaussian prior can noticeably tighten the posterior. The bell-shaped prior gently pulls the posterior toward the literature-informed center.
+- The Gaussian prior can also **shift** the posterior slightly if the literature center doesn't perfectly align with the data -- this is prior influence at work, and whether it's helpful depends on whether the literature values are actually applicable to your site.
+
+The practical takeaway: when data are limited (as they often are in soil science), **the shape of your prior is part of your scientific argument**. Gaussian priors informed by literature values are a principled way to incorporate existing knowledge. But always run a sensitivity comparison like this one to verify that your conclusions aren't driven by the prior alone.
+
+
+# 10. Comparing 1-Pool and 3-Pool Results
+
+How does the 3-pool model compare to the 1-pool model? Let's run a quick 1-pool calibration for comparison and look at bulk predictions from both models.
+
+```{r run-1pool-comparison}
+# Aggregate to bulk observations (same as 1-pool tutorial)
+dat_1pool <- datComb %>%
+  filter(year == 2009 | treatment == "Control") %>%
+  mutate(C_stock_g    = C_stock * 1000,
+         C_stock_sd_g = C_stock_sd * 1000) %>%
+  group_by(year) %>%
+  summarise(
+    C14        = weighted.mean(C14, C_stock_g),
+    C_14_sd    = sqrt(sum((C_stock_g * C_14_sd)^2)) / sum(C_stock_g),
+    C_stock    = sum(C_stock_g),
+    C_stock_sd = sqrt(sum(C_stock_sd_g^2)),
+    .groups = "drop"
+  )
+
+C0_1pool <- dat_1pool$C_stock[dat_1pool$year == 2009]
+F0_1pool <- dat_1pool$C14[dat_1pool$year == 2009]
+years_1pool <- seq(2009, 2022)
+obs_2022_1pool <- dat_1pool %>% filter(year == 2022)
+
+likelihood_1pool <- function(pars) {
+  k     <- pars[1]
+  input <- pars[2]
+  model <- tryCatch(
+    OnepModel14(t = years_1pool, k = k, C0 = C0_1pool,
+                F0_Delta14C = F0_1pool, In = input,
+                inputFc = atmIn, pass = TRUE),
+    error = function(e) return(NULL)
+  )
+  if (is.null(model)) return(-1e10)
+  pred_C14    <- getF14(model)[length(years_1pool), ]
+  pred_Cstock <- getC(model)[length(years_1pool), ]
+  ll_C14    <- dnorm(pred_C14 - obs_2022_1pool$C14, 0,
+                     obs_2022_1pool$C_14_sd, log = TRUE)
+  ll_Cstock <- dnorm(pred_Cstock - obs_2022_1pool$C_stock, 0,
+                     obs_2022_1pool$C_stock_sd, log = TRUE)
+  return(sum(ll_C14, ll_Cstock, na.rm = TRUE))
+}
+
+result_1pool <- run_and_summarize(
+  likelihood_fn = likelihood_1pool,
+  prior_lower   = c(k = 0.001, input = 50),
+  prior_upper   = c(k = 0.1,   input = 1000),
+  par_names     = c("k", "input"),
+  iterations    = 10000,
+  burn_in       = 2000,
+  thin          = 5
+)
+```
+
+```{r compare-predictions, fig.height=6}
+years_plot_cmp <- seq(2009, 2022, by = 0.5)
+
+# 1-pool MAP prediction
+map_1pool <- OnepModel14(
+  t = years_plot_cmp, k = result_1pool$map["k"], C0 = C0_1pool,
+  F0_Delta14C = F0_1pool, In = result_1pool$map["input"],
+  inputFc = atmIn, pass = TRUE
+)
+pred_1pool <- data.frame(
+  year = years_plot_cmp,
+  C14 = as.numeric(getF14(map_1pool)),
+  C_stock = as.numeric(getC(map_1pool)),
+  model = "1-pool"
+)
+
+# 3-pool MAP prediction, aggregated to bulk
+map_3pool_model <- ThreepSeriesModel14(
+  t = years_plot_cmp,
+  ks = c(k1 = result$map["k1"], k2 = result$map["k2"], k3 = result$map["k3"]),
+  C0 = C0_3pool, F0_Delta14C = F0_3pool,
+  In = result$map["input"], a21 = result$map["a21"], a32 = result$map["a32"],
+  inputFc = atmIn, pass = TRUE
+)
+C_3pool   <- getC(map_3pool_model)
+C14_3pool <- getF14(map_3pool_model)
+# Bulk = sum of C stocks; bulk 14C = stock-weighted mean
+bulk_C     <- rowSums(C_3pool)
+bulk_C14   <- rowSums(C_3pool * C14_3pool) / bulk_C
+
+pred_3pool <- data.frame(
+  year = years_plot_cmp,
+  C14 = as.numeric(bulk_C14),
+  C_stock = as.numeric(bulk_C),
+  model = "3-pool (bulk)"
+)
+
+pred_compare <- bind_rows(pred_1pool, pred_3pool)
+
+p_cmp_c14 <- ggplot(pred_compare, aes(x = year, y = C14, color = model)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(data = dat_1pool, aes(x = year, y = C14),
+             inherit.aes = FALSE, size = 4) +
+  geom_errorbar(data = dat_1pool,
+                aes(x = year, ymin = C14 - C_14_sd, ymax = C14 + C_14_sd),
+                inherit.aes = FALSE, width = 0.3) +
+  scale_color_manual(values = c("steelblue", "coral")) +
+  labs(title = expression(paste("Bulk ", Delta^14, "C: 1-Pool vs. 3-Pool")),
+       x = "Year", y = expression(paste(Delta^14, "C (per mil)")),
+       color = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+p_cmp_cstock <- ggplot(pred_compare, aes(x = year, y = C_stock / 1000, color = model)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(data = dat_1pool, aes(x = year, y = C_stock / 1000),
+             inherit.aes = FALSE, size = 4) +
+  geom_errorbar(data = dat_1pool,
+                aes(x = year, ymin = (C_stock - C_stock_sd) / 1000,
+                    ymax = (C_stock + C_stock_sd) / 1000),
+                inherit.aes = FALSE, width = 0.3) +
+  scale_color_manual(values = c("steelblue", "coral")) +
+  labs(title = "Bulk Carbon Stock: 1-Pool vs. 3-Pool",
+       x = "Year", y = expression(paste("C stock (kg m"^-2, ")")),
+       color = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+p_cmp_c14 / p_cmp_cstock
+```
+
+**What does the 3-pool model tell us that the 1-pool model can't?**
+
+- **Layer-specific turnover times**: The 3-pool model estimates that surface organic carbon cycles in ~`r round(1/result$map["k1"])` years, while mineral carbon takes ~`r round(1/result$map["k3"])` years. The 1-pool model gives a single bulk estimate that averages over these very different timescales.
+
+- **Carbon transfer through the profile**: The transfer rates $a_{21}$ and $a_{32}$ quantify how fast carbon moves downward from surface to deep to mineral soil. This is invisible to the 1-pool model.
+
+- **Layer-specific predictions**: The 3-pool model predicts how each individual layer will evolve, not just the bulk. This matters for understanding vulnerability -- surface organic carbon may respond very differently to warming than deep mineral carbon.
+
+**The cost of complexity**: More parameters mean wider posteriors (less certainty per parameter), stronger correlations between parameters, and harder convergence. The 6-parameter posterior is much harder for MCMC to explore than the 2-parameter posterior. This is the classic bias-variance tradeoff in modeling -- more complex models can capture more reality, but they're harder to constrain from limited data.
+
+
+# 11. Wrapping Up
+
+## Key takeaways
+
+1. **Multi-pool models capture real structure** that single-pool models miss. The three soil layers have genuinely different turnover times, and a 3-pool model can estimate these separately.
+
+2. **More parameters = harder inference**. With 6 parameters and 6 data points, parameter correlations become important. Always check the posterior correlation matrix -- it tells you which parameters the data can and can't independently constrain.
+
+3. **Prior shape matters for weakly constrained parameters**. We saw in Section 9 that switching from uniform to Gaussian priors can noticeably affect posteriors for parameters with weak data constraint. When data are limited, the prior is part of your scientific argument -- choose it deliberately and always run a sensitivity analysis.
+
+4. **Trace plot diagnosis is even more critical** with more parameters. Some parameters (especially for slow pools) may mix poorly because the data provide weak constraints. This is a feature, not a bug -- it tells you where the data are uninformative.
+
+5. **The uncertainty scaling factor** (0.4) on the likelihood matters a lot. It accounts for the gap between measurement uncertainty and model structural error. Experiment with it to understand its effect.
+
+6. **Model comparison is essential**. Comparing 1-pool and 3-pool predictions side by side (Section 10) reveals when the extra complexity is justified and when a simpler model suffices.
+
+## Suggestions for further exploration
+
+- **Try feedback topology**: Instead of a pure series model (carbon only flows downward), allow some upward transfer. How does this change the posteriors?
+
+- **Try the warming treatment**: The `datComb` table also contains a "Warming" treatment. What happens to decomposition rates under experimental warming?
+
+- **Try log-normal priors for k**: Decomposition rates span orders of magnitude, making log-normal priors a natural choice. Use `createPrior()` with a custom density and sampler function.
+
+- **Increase iterations**: Try 100,000 iterations. Do the posteriors change? If so, 20,000 wasn't enough for full convergence.
+
+```{r session-info}
+sessionInfo()
+```
