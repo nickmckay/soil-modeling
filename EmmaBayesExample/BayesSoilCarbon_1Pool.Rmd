@@ -1,6 +1,6 @@
 ---
-title: "Bayesian Soil Carbon Modeling: A 1-Pool Tutorial"
-author: "Soil Carbon Modeling Project"
+title: "Bayesian Soil Carbon Modeling: 1-Pool Tutorial"
+author: "ACE/Stats-Modeling Seminar Spring 2026"
 date: "`r Sys.Date()`"
 output:
   html_document:
@@ -38,7 +38,9 @@ set.seed(42)
 load("soilRmcmc.RData")
 ```
 
-We also define a helper function that we'll reuse throughout this tutorial. It runs the MCMC, extracts posterior samples, and computes summary statistics -- all in one call. This avoids copy-pasting the same pipeline every time we want to try different settings.
+[You can download soilRmcmc.RData here.](https://github.com/nickmckay/soil-modeling/raw/refs/heads/main/EmmaBayesExample/soilRmcmc.RData)
+
+In addition we'll also define a helper function that we'll reuse throughout this tutorial. It runs the MCMC, extracts posterior samples, and computes summary statistics -- all in one call. This avoids copy-pasting the same pipeline every time we want to try different settings.
 
 ```{r helper-functions}
 # Run MCMC and return a tidy list of results
@@ -154,7 +156,7 @@ ggplot(subset(atmIn, YEAR >= 1940), aes(x = YEAR, y = Atmosphere)) +
 
 ## The CiPEHR observations
 
-Our data come from the CiPEHR (Carbon in Permafrost, Experimental Heating Research) experiment in interior Alaska. Soil cores were measured at two time points: 2009 (baseline) and 2022 (after 13 years). Each core is divided into three layers (surface organic, deep organic, mineral), with measurements of both carbon stock (how much carbon is there) and $\Delta^{14}$C (how "old" it is).
+Our data (Emma's data) come from the CiPEHR (Carbon in Permafrost, Experimental Heating Research) experiment in interior Alaska. Soil cores were measured at two time points: 2009 (baseline) and 2022 (after 13 years). Each core is divided into three layers (surface organic, deep organic, mineral), with measurements of both carbon stock (how much carbon is there) and $\Delta^{14}$C (how "old" it is).
 
 ```{r show-data}
 knitr::kable(as.data.frame(datComb), digits = 1,
@@ -165,7 +167,7 @@ knitr::kable(as.data.frame(datComb), digits = 1,
 
 For this tutorial, we simplify: instead of modeling three separate layers, we combine them into a single "bulk soil" pool. We sum the carbon stocks across layers, and compute a stock-weighted mean for $^{14}$C. This gives us just two observations (2009 and 2022) to work with.
 
-This is a deliberate simplification for learning. A real analysis might model the layers separately (as the 3-pool model in `BayesSoilCarbon_Tutorial.R` does), but the 1-pool version lets us focus on the Bayesian machinery without getting lost in model complexity.
+This is a deliberate simplification for learning. A real analysis might model the layers separately ([as we do with a 3-pool model here](BayesSoilCarbon_3Pool.html)), but the 1-pool version lets us focus on the Bayesian machinery without getting lost in model complexity.
 
 ```{r aggregate-1pool}
 dat_1pool <- datComb %>%
@@ -422,7 +424,7 @@ ggplot(chain_long_default, aes(x = iteration, y = value, color = chain)) +
   theme(legend.position = "top")
 ```
 
-The **log-posterior** panel (bottom) is especially useful for setting burn-in: it shows the objective value the sampler is trying to maximize. The initial climb represents chains finding the high-probability region. Once the log-posterior reaches a stable plateau, the chains have converged. Everything before the plateau is burn-in.
+The **log-posterior** panel (bottom) is especially useful for setting burn-in: it shows the objective value the sampler is trying to maximize. In this simple case, there isn't much of an initial climb and the log-posterior reaches the plateau almost immediately. In more complex examples you'll see a steady rise. The initial climb represents chains finding the high-probability region. Once the log-posterior reaches a stable plateau, the chains have converged. Everything before the plateau is called the burn-in.
 
 ## Burn-in and thinning
 
@@ -470,19 +472,7 @@ ggplot() +
 
 ## MAP estimate and credible intervals
 
-The **MAP** (Maximum A Posteriori) is the single most probable parameter combination. The **90% credible interval** tells us the range containing 90% of the posterior probability.
-
-```{r map-summary-default}
-cat("=== 1-Pool Posterior Summary (Default) ===\n")
-cat(sprintf("%-8s  %8s  %10s  %10s  %10s\n",
-            "Param", "MAP", "Median", "90% lo", "90% hi"))
-for (i in seq_len(nrow(result_default$summary))) {
-  r <- result_default$summary[i, ]
-  cat(sprintf("%-8s  %8.4f  %10.4f  %10.4f  %10.4f\n",
-              r$parameter, result_default$map[r$parameter],
-              r$median, r$lower_90, r$upper_90))
-}
-```
+The **MAP** (Maximum A Posteriori) is the single most probable parameter combination. The **90% credible interval** tells us the range containing 90% of the posterior probability. The choice of 90% is arbitrary, but common. You'll also see 95%, but could theoretically use anything if you can justify it.
 
 ## Model predictions with uncertainty
 
@@ -747,7 +737,7 @@ ggplot(all_posteriors, aes(x = value, fill = prior_type)) +
 - **Offset** is the cautionary tale: when the prior completely excludes the region the data favor, the posterior piles up at the prior boundary. The MCMC can't go where the prior says "impossible," no matter how much the data want it there.
 - **Gaussian vs. uniform**: The Gaussian prior may produce a slightly tighter posterior than the default uniform, because it gently down-weights extreme values rather than treating them as equally likely. But when the data are strong, the difference is subtle. The Gaussian prior would matter much more with weaker or fewer data points.
 
-The key lesson: **prior shape matters less than prior coverage**. A uniform and a Gaussian with similar coverage produce similar posteriors. But a prior that *excludes* the truth (like Offset) is catastrophic regardless of its shape.
+The key lesson here, which is often true is that **prior shape matters less than prior coverage**. A uniform and a Gaussian with similar coverage produce similar posteriors. But a prior that *excludes* the truth (like Offset) is catastrophic regardless of its shape.
 
 
 # 9. Experiment: Effect of MCMC Settings
@@ -889,6 +879,3 @@ The key lesson: always inspect your trace plots and check convergence before tru
 
 - **Model comparison**: Could you compare the 1-pool model to a 2-pool or 3-pool model using Bayesian model selection (e.g., DIC or Bayes factors)?
 
-```{r session-info}
-sessionInfo()
-```

@@ -1,6 +1,6 @@
 ---
-title: "Bayesian Soil Carbon Modeling: A 3-Pool Tutorial"
-author: "Soil Carbon Modeling Project"
+title: "Bayesian Soil Carbon Modeling: 3-Pool Tutorial"
+author: "ACE/Stats-Modeling Seminar Spring 2026"
 date: "`r Sys.Date()`"
 output:
   html_document:
@@ -457,12 +457,22 @@ prior_long_gauss <- prior_samples_gauss %>%
 
 prior_long <- bind_rows(prior_long_unif, prior_long_gauss)
 
-ggplot(prior_long, aes(x = value, fill = prior_type)) +
-  geom_density(alpha = 0.4, linewidth = 0.6) +
+# Analytical rectangles for uniform prior
+prior_rect_compare <- data.frame(
+  parameter = factor(par_names, levels = par_names),
+  xmin = prior_lower,
+  xmax = prior_upper,
+  ymax = 1 / (prior_upper - prior_lower)
+)
+
+ggplot() +
+  geom_rect(data = prior_rect_compare,
+            aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = ymax),
+            fill = "skyblue", alpha = 0.4) +
+  geom_density(data = prior_long_gauss, aes(x = value),
+               fill = "coral", alpha = 0.4, linewidth = 0.6) +
   facet_wrap(~ parameter, scales = "free", ncol = 3) +
-  scale_fill_manual(values = c("Gaussian" = "coral", "Uniform" = "skyblue"),
-                    name = "Prior type") +
-  labs(title = "Uniform vs. Gaussian (Truncated Normal) Priors",
+  labs(title = "Uniform (blue) vs. Gaussian (coral) Priors",
        subtitle = "Same physical bounds, but Gaussian concentrates probability near the center",
        x = "Parameter value", y = "Density") +
   theme_minimal(base_size = 12) +
@@ -548,10 +558,18 @@ posterior_long <- result$posterior_df %>%
   pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
   mutate(parameter = factor(parameter, levels = par_names))
 
+# Analytical uniform prior density as rectangles
+prior_rect_df <- data.frame(
+  parameter = factor(par_names, levels = par_names),
+  xmin = prior_lower,
+  xmax = prior_upper,
+  ymax = 1 / (prior_upper - prior_lower)
+)
+
 ggplot() +
-  geom_histogram(data = prior_long_unif,
-                 aes(x = value, y = after_stat(density)),
-                 bins = 40, fill = "skyblue", alpha = 0.4, color = "white") +
+  geom_rect(data = prior_rect_df,
+            aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = ymax),
+            fill = "skyblue", alpha = 0.4) +
   geom_density(data = posterior_long, aes(x = value),
                fill = "coral", alpha = 0.5, linewidth = 0.8) +
   geom_vline(data = data.frame(
@@ -621,8 +639,6 @@ In multi-parameter models, parameters often **trade off** against each other. Fo
 
 ```{r correlation-matrix, fig.height=5}
 cor_mat <- cor(result$posterior_df)
-
-cat("--- Posterior Correlation Matrix ---\n")
 print(round(cor_mat, 2))
 ```
 
@@ -781,32 +797,6 @@ ggplot(posteriors_compare, aes(x = value, fill = prior_type)) +
   theme(legend.position = "top")
 ```
 
-## Summary comparison
-
-```{r prior-type-summary}
-summary_gauss <- result_gauss$summary %>%
-  mutate(
-    prior_range = prior_upper[parameter] - prior_lower[parameter],
-    post_range  = upper_90 - lower_90,
-    uncert_reduction = round(100 * (1 - post_range / prior_range), 1)
-  )
-
-cat("=== Uniform Prior: Posterior Summary ===\n")
-cat(sprintf("%-8s  %10s  %10s  %10s\n", "Param", "Median", "90% lo", "90% hi"))
-for (i in seq_len(nrow(summary_with_reduction))) {
-  r <- summary_with_reduction[i, ]
-  cat(sprintf("%-8s  %10.4f  %10.4f  %10.4f\n",
-              r$parameter, r$median, r$lower_90, r$upper_90))
-}
-
-cat("\n=== Gaussian Prior: Posterior Summary ===\n")
-cat(sprintf("%-8s  %10s  %10s  %10s\n", "Param", "Median", "90% lo", "90% hi"))
-for (i in seq_len(nrow(summary_gauss))) {
-  r <- summary_gauss[i, ]
-  cat(sprintf("%-8s  %10.4f  %10.4f  %10.4f\n",
-              r$parameter, r$median, r$lower_90, r$upper_90))
-}
-```
 
 **What to notice:**
 
@@ -961,7 +951,7 @@ p_cmp_c14 / p_cmp_cstock
 
 2. **More parameters = harder inference**. With 6 parameters and 6 data points, parameter correlations become important. Always check the posterior correlation matrix -- it tells you which parameters the data can and can't independently constrain.
 
-3. **Prior shape matters for weakly constrained parameters**. We saw in Section 9 that switching from uniform to Gaussian priors can noticeably affect posteriors for parameters with weak data constraint. When data are limited, the prior is part of your scientific argument -- choose it deliberately and always run a sensitivity analysis.
+3. **Prior shape matters more for weakly constrained parameters**. We saw in Section 9 that switching from uniform to Gaussian priors can noticeably affect posteriors for parameters with weak data constraint. When data are limited, the prior is part of your scientific argument -- choose it deliberately and always run a sensitivity analysis.
 
 4. **Trace plot diagnosis is even more critical** with more parameters. Some parameters (especially for slow pools) may mix poorly because the data provide weak constraints. This is a feature, not a bug -- it tells you where the data are uninformative.
 
@@ -979,6 +969,3 @@ p_cmp_c14 / p_cmp_cstock
 
 - **Increase iterations**: Try 100,000 iterations. Do the posteriors change? If so, 20,000 wasn't enough for full convergence.
 
-```{r session-info}
-sessionInfo()
-```
