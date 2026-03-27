@@ -1,0 +1,809 @@
+---
+title: "Bayesian Soil Carbon Modeling: ACE Post-Fire Sites"
+author: "ACE/Stats-Modeling Seminar Spring 2026"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+
+# 1. Setup
+
+This tutorial builds on the 1-pool and 3-pool CiPEHR tutorials and applies the same Bayesian workflow to a new dataset: post-fire black spruce sites in interior Alaska from the ACE (Alaska Carbon and Environment) project. If you haven't worked through the CiPEHR tutorials yet, start there -- they introduce the Bayesian machinery step by step.
+
+The forward model here uses our own `solve_npool_model()` from `NPool14C.R` (sourced via `FlexiblePool14C.R`) instead of SoilR's built-in series model. The Bayesian machinery -- `BayesianTools`, `DREAMzs`, the `run_and_summarize()` helper -- is identical.
+
+```{r load-libraries, results='hide', message=FALSE, warning=FALSE}
+# FlexiblePool14C.R sources NPool14C.R and loads deSolve, SoilR, ggplot2, dplyr, tidyr, patchwork
+source("FlexiblePool14C.R")
+library(BayesianTools)
+library(readr)
+
+set.seed(42)
+```
+
+We reuse the same `run_and_summarize()` helper from the CiPEHR tutorials.
+
+```{r helper-function}
+run_and_summarize <- function(likelihood_fn, prior = NULL,
+                              prior_lower = NULL, prior_upper = NULL,
+                              par_names,
+                              iterations = 20000,
+                              burn_in = 5000, thin = 10) {
+
+  if (is.null(prior)) {
+    prior <- createUniformPrior(lower = prior_lower, upper = prior_upper)
+  }
+
+  bt_setup <- createBayesianSetup(
+    likelihood = likelihood_fn,
+    prior      = prior,
+    names      = par_names
+  )
+
+  mcmc_out <- runMCMC(
+    bayesianSetup = bt_setup,
+    sampler       = "DREAMzs",
+    settings      = list(iterations = iterations, message = FALSE)
+  )
+
+  raw_chains <- getSample(mcmc_out, start = 1, coda = TRUE, parametersOnly = FALSE)
+  chain_df <- do.call(rbind, lapply(seq_along(raw_chains), function(i) {
+    ch <- as.data.frame(as.matrix(raw_chains[[i]]))
+    n_par <- length(par_names)
+    colnames(ch)[1:n_par] <- par_names
+    ch$log_posterior <- ch[, n_par + 1]
+    ch <- ch[, c(par_names, "log_posterior")]
+    ch$iteration <- seq_len(nrow(ch))
+    ch$chain <- factor(i)
+    ch
+  }))
+
+  samples <- getSample(mcmc_out, start = burn_in, thin = thin)
+  colnames(samples) <- par_names
+  posterior_df <- as.data.frame(samples)
+
+  map_est <- MAP(mcmc_out, start = burn_in)$parametersMAP
+  names(map_est) <- par_names
+
+  summary_tbl <- posterior_df %>%
+    pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+    group_by(parameter) %>%
+    summarise(
+      median   = median(value),
+      lower_90 = quantile(value, 0.05),
+      upper_90 = quantile(value, 0.95),
+      .groups  = "drop"
+    )
+
+  list(
+    mcmc_out     = mcmc_out,
+    chain_df     = chain_df,
+    posterior_df = posterior_df,
+    map          = map_est,
+    summary      = summary_tbl,
+    burn_in      = burn_in,
+    thin         = thin
+  )
+}
+```
+
+
+# 2. Scientific Background
+
+In 2004, a large wildfire burned through black spruce-dominated boreal forest in interior Alaska. Soil samples were collected at six sites **one year post-fire (2005)** and again **eighteen years post-fire (2023)**.
+
+All sites were dominated by black spruce before the fire. By 2023, some had returned to spruce dominance while others had transitioned to deciduous species (mostly birch and aspen). This transition matters because spruce and deciduous species have different litter chemistry, root inputs, and canopy effects -- all of which influence how fast carbon cycles through the soil.
+
+The key question: **do decomposition rates and carbon inputs differ between spruce and deciduous post-fire trajectories?** We have two data types to answer this:
+
+- **Carbon stocks** (kg C / m²) for each soil horizon, which tell us how much carbon is stored.
+- **$\Delta^{14}$C** (per mil), which tells us how old the carbon is. Fast-cycling pools have incorporated bomb $^{14}$C from the 1960s (positive $\Delta^{14}$C); slow-cycling pools have barely responded (negative $\Delta^{14}$C).
+
+By fitting a model to both data types at both time points, we can estimate pool-specific decomposition rates and carbon inputs for each vegetation trajectory.
+
+
+# 3. The Data
+
+```{r load-data}
+dat_raw <- read_csv("dat.ace.horizons.csv", show_col_types = FALSE)
+
+# Quick look at the structure
+knitr::kable(
+  dat_raw %>% arrange(veg_traj, site, year, horizon_standard),
+  digits = 1,
+  caption = "Raw ACE soil data: C stocks and Delta-14C by horizon, site, and year"
+)
+```
+
+The horizons, in order from surface to depth:
+
+- **Above Char**: organic material that accumulated above the fire char layer. Only present in 2023 -- it represents new post-fire organic matter.
+- **Dead Moss** and **Fibric**: the upper, relatively undecomposed organic layer.
+- **Humic**: the lower, more decomposed organic layer.
+- **M1** and **M2**: the top 5 cm and 5-10 cm of mineral soil.
+
+Let's visualize the $\Delta^{14}$C and carbon stocks by horizon and vegetation trajectory.
+
+```{r plot-raw-data, fig.height=7}
+horizon_order <- c("Above Char", "Dead Moss", "Fibric", "Humic", "M1", "M2")
+dat_plot <- dat_raw %>%
+  mutate(
+    horizon_standard = factor(horizon_standard, levels = horizon_order),
+    year = factor(year)
+  )
+
+p_c14 <- ggplot(dat_plot, aes(x = C14, y = horizon_standard, color = year, shape = veg_traj)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbarh(
+    aes(xmin = C14 - C14_sd, xmax = C14 + C14_sd),
+    height = 0.25, position = position_dodge(width = 0.4)
+  ) +
+  scale_y_discrete(limits = rev(horizon_order)) +
+  scale_color_manual(values = c("2005" = "steelblue", "2023" = "tomato")) +
+  labs(
+    title = expression(paste(Delta^14, "C by horizon")),
+    x = expression(paste(Delta^14, "C (per mil)")),
+    y = NULL, color = "Year", shape = "Vegetation"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+
+p_cstock <- ggplot(dat_plot, aes(x = C_stock, y = horizon_standard, color = year, shape = veg_traj)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbarh(
+    aes(xmin = C_stock - C_stock_sd, xmax = C_stock + C_stock_sd),
+    height = 0.25, position = position_dodge(width = 0.4)
+  ) +
+  scale_y_discrete(limits = rev(horizon_order)) +
+  scale_color_manual(values = c("2005" = "steelblue", "2023" = "tomato")) +
+  labs(
+    title = "Carbon stock by horizon",
+    x = expression(paste("C stock (kg C m"^-2, ")")),
+    y = NULL, color = "Year", shape = "Vegetation"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+
+p_c14 + p_cstock + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+A few things to notice:
+
+- **Dead Moss and Fibric** have strongly positive $\Delta^{14}$C in 2005 (bomb-enriched), confirming fast turnover on decadal timescales.
+- **M1 and M2** are consistently negative, indicating slow-cycling pre-bomb carbon in the mineral soil.
+- **Humic** falls in between and varies more between sites.
+- **Deciduous sites are missing Dead Moss and Fibric** in 2005 at most sites -- the high-severity fire at those locations burned away the surface organic layer.
+
+
+# 4. Pool Aggregation
+
+Our model has three pools that mirror the structure used in the 3-pool CiPEHR tutorial:
+
+| Pool | Horizons included | Rationale |
+|------|-------------------|-----------|
+| 1. Fast organic | Dead Moss, Fibric, Above Char | Bomb-enriched; fast-cycling surface litter |
+| 2. Stabilized organic | Humic | Intermediate age; more decomposed |
+| 3. Mineral | M1 + M2 | Pre-bomb; slow-cycling |
+
+This structure is symmetric across vegetation types: all sites have carbon in each pool (though the fast organic pool is near zero for deciduous sites in 2005 where the organic layer burned). Above Char is included in Pool 1 in 2023 because it represents the new fast-cycling organic layer that has accumulated since the fire.
+
+For carbon stock, we sum across horizons in each pool. For $\Delta^{14}$C, we take a carbon-stock-weighted mean, excluding horizons with missing $\Delta^{14}$C measurements.
+
+```{r aggregate-pools}
+pool_map <- tibble(
+  horizon_standard = c("Dead Moss", "Fibric", "Above Char", "Humic", "M1", "M2"),
+  pool = c("fast_organic", "fast_organic", "fast_organic",
+           "stab_organic", "mineral", "mineral")
+)
+
+pool_levels <- c("fast_organic", "stab_organic", "mineral")
+pool_labels <- c("Fast organic\n(Dead Moss + Fibric + Above Char)",
+                 "Stabilized organic\n(Humic)",
+                 "Mineral\n(M1 + M2)")
+
+# Weighted mean and propagated SD for Delta-14C
+wtd_mean_c14 <- function(c14, c_stock) {
+  ok <- !is.na(c14) & !is.na(c_stock) & c_stock > 0
+  if (!any(ok)) return(NA_real_)
+  weighted.mean(c14[ok], w = c_stock[ok])
+}
+
+wtd_sd_c14 <- function(c14, c14_sd, c_stock) {
+  ok <- !is.na(c14) & !is.na(c14_sd) & !is.na(c_stock) & c_stock > 0
+  if (!any(ok)) return(NA_real_)
+  w <- c_stock[ok] / sum(c_stock[ok])
+  sqrt(sum((w * c14_sd[ok])^2))
+}
+
+dat_pools <- dat_raw %>%
+  left_join(pool_map, by = "horizon_standard") %>%
+  filter(!is.na(pool)) %>%
+  group_by(veg_traj, site, year, pool) %>%
+  summarise(
+    C_stock    = sum(C_stock, na.rm = TRUE),
+    C_stock_sd = sqrt(sum(C_stock_sd^2, na.rm = TRUE)),
+    C14        = wtd_mean_c14(C14, C_stock),
+    C14_sd     = wtd_sd_c14(C14, C14_sd, C_stock),
+    .groups = "drop"
+  ) %>%
+  # Ensure every site has all 3 pools in both years
+  # (fills missing with 0 C stock, NA for 14C)
+  complete(
+    nesting(veg_traj, site), year, pool,
+    fill = list(C_stock = 0, C_stock_sd = NA_real_, C14 = NA_real_, C14_sd = NA_real_)
+  ) %>%
+  mutate(pool = factor(pool, levels = pool_levels, labels = pool_labels))
+
+# Replace any remaining NA SDs with the pool-level median, so the
+# likelihood function never receives a missing standard deviation
+dat_pools <- dat_pools %>%
+  group_by(pool) %>%
+  mutate(
+    C_stock_sd = ifelse(is.na(C_stock_sd),
+                        median(C_stock_sd, na.rm = TRUE), C_stock_sd),
+    C14_sd     = ifelse(is.na(C14_sd),
+                        median(C14_sd, na.rm = TRUE), C14_sd)
+  ) %>%
+  ungroup()
+```
+
+Let's look at the aggregated data.
+
+```{r show-aggregated, fig.height=5}
+knitr::kable(
+  dat_pools %>% arrange(veg_traj, site, year, pool) %>%
+    select(veg_traj, site, year, pool, C_stock, C_stock_sd, C14, C14_sd),
+  digits = 2,
+  caption = "Aggregated 3-pool observations by site and year"
+)
+```
+
+```{r plot-aggregated, fig.height=6}
+dat_pools_plot <- dat_pools %>%
+  mutate(year = factor(year), veg_site = paste0(veg_traj, "-", site))
+
+p_agg_c14 <- ggplot(dat_pools_plot,
+                    aes(x = C14, y = pool, color = year, shape = veg_traj)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = C14 - C14_sd, xmax = C14 + C14_sd),
+                 height = 0.3, position = position_dodge(width = 0.5)) +
+  scale_y_discrete(limits = rev(pool_labels)) +
+  scale_color_manual(values = c("2005" = "steelblue", "2023" = "tomato")) +
+  labs(title = expression(paste(Delta^14, "C by pool")),
+       x = expression(paste(Delta^14, "C (per mil)")),
+       y = NULL, color = "Year", shape = "Veg") +
+  theme_minimal(base_size = 12)
+
+p_agg_cs <- ggplot(dat_pools_plot,
+                   aes(x = C_stock, y = pool, color = year, shape = veg_traj)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = C_stock - C_stock_sd, xmax = C_stock + C_stock_sd),
+                 height = 0.3, position = position_dodge(width = 0.5)) +
+  scale_y_discrete(limits = rev(pool_labels)) +
+  scale_color_manual(values = c("2005" = "steelblue", "2023" = "tomato")) +
+  labs(title = "Carbon stock by pool",
+       x = expression(paste("C stock (kg C m"^-2, ")")),
+       y = NULL, color = "Year", shape = "Veg") +
+  theme_minimal(base_size = 12)
+
+p_agg_c14 + p_agg_cs + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+The three-pool structure clearly separates the $\Delta^{14}$C signals: fast organic is bomb-enriched (positive), stabilized organic is near-modern, and mineral is firmly pre-bomb (negative). Deciduous sites (triangles) tend to have smaller fast organic pools in 2005, reflecting the more complete burn.
+
+
+# 5. Atmospheric $^{14}$C Record
+
+The model needs the atmospheric $\Delta^{14}$C as a time-varying forcing. We use SoilR's IntCal13 pre-bomb record combined with the Hua et al. (2013) NH Zone 1 post-bomb record, which extends to approximately 2012. We append approximate values for 2013-2024 based on the known continued decline of atmospheric $\Delta^{14}$C (Graven et al. 2017 and subsequent NH Zone 1 records). These post-2012 values are approximate; a full analysis should use measured atmospheric data through the sampling date.
+
+```{r atmospheric-data, fig.height=4}
+# SoilR built-in atmospheric record (pre-bomb IntCal13 + Hua 2013 post-bomb)
+ad      <- bind.C14curves(prebomb = IntCal13, postbomb = Hua2013$NHZone1,
+                          time.scale = "AD")
+atm_base <- data.frame(time = ad[, 1], Delta14C = ad[, 2]) %>%
+  filter(time < 2013)
+
+# Approximate NH Zone 1 extension 2013-2024
+# Based on Graven et al. (2017) and subsequent atmospheric monitoring
+atm_ext <- data.frame(
+  time     = 2013:2024,
+  Delta14C = c(18, 14, 10, 7, 4, 2, 0, -2, -4, -5, -6, -7)
+)
+
+atm_combined <- bind_rows(atm_base, atm_ext)
+atm_data     <- prepare_atm_data(atm_combined)   # converts Delta14C to fraction modern
+
+ggplot(atm_combined %>% filter(time >= 1940), aes(x = time, y = Delta14C)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  geom_vline(xintercept = c(2005, 2023), linetype = "dashed", color = "tomato") +
+  annotate("text", x = 2005.5, y = 600, label = "2005\n(sampling)", hjust = 0,
+           color = "tomato", size = 3.5) +
+  annotate("text", x = 2023.5, y = 600, label = "2023\n(sampling)", hjust = 0,
+           color = "tomato", size = 3.5) +
+  labs(title = "Atmospheric 14C: The Bomb Spike",
+       subtitle = "Dashed lines mark the two ACE sampling years",
+       x = "Year", y = expression(paste(Delta^14, "C (per mil)"))) +
+  theme_minimal(base_size = 14)
+```
+
+By 2005 (one year after the fire), atmospheric $\Delta^{14}$C had declined to about +60 per mil. By 2023, it had fallen below 0. Fast-cycling soil carbon tracks this decline closely; slow-cycling pools barely respond over 18 years.
+
+
+# 6. The Forward Model: 3-Pool Series
+
+## Structure
+
+The model is a **3-pool series**: carbon enters only the surface (fast organic) pool, then cascades downward as it decomposes.
+
+$$\text{Atmosphere} \xrightarrow{I} \text{Pool 1 (fast organic)} \xrightarrow{a_{21}} \text{Pool 2 (stabilized organic)} \xrightarrow{a_{32}} \text{Pool 3 (mineral)}$$
+
+The compartmental matrix is:
+
+$$A = \begin{pmatrix} -k_1 & 0 & 0 \\ a_{21} & -k_2 & 0 \\ 0 & a_{32} & -k_3 \end{pmatrix}$$
+
+This is the same topology as the CiPEHR 3-pool tutorial. The only change is that we call `solve_npool_model()` from our own framework rather than SoilR's `ThreepSeriesModel14()`.
+
+## Parameters
+
+| Parameter | Description | Units |
+|-----------|-------------|-------|
+| `k1` | Decomposition rate, fast organic | yr$^{-1}$ |
+| `k2` | Decomposition rate, stabilized organic | yr$^{-1}$ |
+| `k3` | Decomposition rate, mineral | yr$^{-1}$ |
+| `input` | Carbon input rate to Pool 1 (surface) | kg C m$^{-2}$ yr$^{-1}$ |
+| `a21` | Transfer rate, Pool 1 $\to$ Pool 2 | yr$^{-1}$ |
+| `a32` | Transfer rate, Pool 2 $\to$ Pool 3 | yr$^{-1}$ |
+
+One physical constraint must hold: transfer rates cannot exceed decomposition rates ($a_{21} < k_1$, $a_{32} < k_2$). Otherwise a pool would send out more carbon via transfer than it decomposes, which is not physically meaningful. We enforce this in the likelihood function.
+
+## Forward model wrapper
+
+```{r forward-model-wrapper}
+# Wrapper around solve_npool_model() for the 3-pool series topology.
+# Takes the same parameter structure as the 3-pool CiPEHR tutorial.
+#
+# C0            : initial C stocks (length 3, kg C / m2)
+# F0_delta14C   : initial Delta14C (length 3, per mil)
+# times         : time vector (years)
+# atm           : atmospheric data frame from prepare_atm_data()
+
+run_3pool_model <- function(k1, k2, k3, input, a21, a32,
+                            C0, F0_delta14C, times, atm) {
+  T_mat        <- matrix(0, 3, 3)
+  T_mat[2, 1]  <- a21   # Pool 1 -> Pool 2
+  T_mat[3, 2]  <- a32   # Pool 2 -> Pool 3
+
+  F0 <- delta14C_to_F(F0_delta14C)
+
+  tryCatch(
+    solve_npool_model(
+      times           = times,
+      k               = c(k1, k2, k3),
+      C0              = C0,
+      F0              = F0,
+      total_input     = input,
+      input_fractions = c(1, 0, 0),   # all inputs enter Pool 1
+      transfer_matrix = T_mat,
+      F_atm_data      = atm
+    ),
+    error = function(e) NULL
+  )
+}
+```
+
+## Forward model demo
+
+Let's run the model for **site 54 (spruce)**, using the 2005 data as initial conditions and running to 2023. We'll try a few hand-picked parameter sets to build intuition before fitting.
+
+```{r forward-demo, fig.height=7}
+years_model <- seq(2005, 2023)
+
+# Extract site 54 initial conditions (2005)
+init_54 <- dat_pools %>% filter(site == 54, year == 2005) %>% arrange(pool)
+obs_54  <- dat_pools %>% filter(site == 54, year == 2023) %>% arrange(pool)
+
+# For pools with NA Delta-14C in initial conditions (C stock = 0),
+# use the atmospheric value at 2005 as a placeholder.
+# It doesn't affect the ODE since C14_0 = C0 * F0 = 0 when C0 = 0.
+atm_delta_2005 <- F_to_delta14C(
+  approx(atm_data$time, atm_data$F_atm, xout = 2005)$y
+)
+F0_54 <- ifelse(is.na(init_54$C14), atm_delta_2005, init_54$C14)
+
+demo_params <- list(
+  list(k1 = 0.15, k2 = 0.01, k3 = 0.001, input = 0.5,  a21 = 0.05, a32 = 0.003, label = "Fast surface"),
+  list(k1 = 0.05, k2 = 0.01, k3 = 0.001, input = 0.3,  a21 = 0.02, a32 = 0.003, label = "Slow surface"),
+  list(k1 = 0.10, k2 = 0.02, k3 = 0.002, input = 0.4,  a21 = 0.04, a32 = 0.008, label = "High transfer")
+)
+
+demo_runs <- bind_rows(lapply(demo_params, function(dp) {
+  m <- run_3pool_model(
+    dp$k1, dp$k2, dp$k3, dp$input, dp$a21, dp$a32,
+    C0 = init_54$C_stock, F0_delta14C = F0_54,
+    times = seq(2005, 2023, by = 0.5), atm = atm_data
+  )
+  if (is.null(m)) return(NULL)
+  data.frame(
+    year    = rep(seq(2005, 2023, by = 0.5), 3),
+    pool    = rep(pool_labels, each = length(seq(2005, 2023, by = 0.5))),
+    C14     = as.vector(getF14_npool(m)),
+    C_stock = as.vector(getC_npool(m)),
+    scenario = dp$label
+  )
+}))
+
+demo_runs$pool <- factor(demo_runs$pool, levels = pool_labels)
+obs_54_plot    <- bind_rows(
+  init_54 %>% mutate(year = 2005),
+  obs_54  %>% mutate(year = 2023)
+)
+
+p_demo_c14 <- ggplot(demo_runs, aes(x = year, y = C14, color = scenario)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = obs_54_plot, aes(x = year, y = C14),
+             inherit.aes = FALSE, size = 3) +
+  geom_errorbar(data = obs_54_plot,
+                aes(x = year, ymin = C14 - C14_sd, ymax = C14 + C14_sd),
+                inherit.aes = FALSE, width = 0.3) +
+  facet_wrap(~ pool, ncol = 1, scales = "free_y") +
+  labs(title = expression(paste("Forward demo: ", Delta^14, "C (site 54)")),
+       x = "Year", y = expression(paste(Delta^14, "C (per mil)")),
+       color = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "top")
+
+p_demo_cs <- ggplot(demo_runs, aes(x = year, y = C_stock, color = scenario)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = obs_54_plot, aes(x = year, y = C_stock),
+             inherit.aes = FALSE, size = 3) +
+  geom_errorbar(data = obs_54_plot,
+                aes(x = year, ymin = C_stock - C_stock_sd, ymax = C_stock + C_stock_sd),
+                inherit.aes = FALSE, width = 0.3) +
+  facet_wrap(~ pool, ncol = 1, scales = "free_y") +
+  labs(title = "Forward demo: C stock (site 54)",
+       x = "Year", y = expression(paste("C stock (kg C m"^-2, ")")),
+       color = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "top")
+
+p_demo_c14 + p_demo_cs
+```
+
+No single hand-picked parameter set fits all three pools simultaneously -- exactly the challenge MCMC is designed to solve. Notice how the fast organic pool is particularly sensitive to `k1` and the transfer rate `a21`, while the mineral pool barely moves over 18 years regardless of parameters.
+
+
+# 7. The Likelihood Function
+
+The likelihood compares model predictions to observations at **2023** across all three pools. We use the same Gaussian log-likelihood structure as the CiPEHR tutorials:
+
+$$\log L = \sum_{\text{pools}} \left[ \log \mathcal{N}(\hat{C}_{14} - C_{14}^{\text{obs}}, \, 0, \, \sigma_{C_{14}}) + \log \mathcal{N}(\hat{C} - C^{\text{obs}}, \, 0, \, \sigma_C) \right]$$
+
+where $\hat{C}_{14}$ and $\hat{C}$ are model predictions at 2023, and $\sigma$ values are the observed standard deviations from the data.
+
+Pools with missing observed $\Delta^{14}$C (NA) automatically contribute zero to the likelihood sum via `na.rm = TRUE`. This is the appropriate treatment: we simply cannot learn about those pools from the missing measurement.
+
+```{r likelihood-factory}
+# Returns a likelihood function closed over the initial conditions and 2023 observations
+# for a specific site.
+make_likelihood <- function(C0, F0_delta14C, obs_2023) {
+  function(pars) {
+    k1    <- pars[1]; k2 <- pars[2]; k3 <- pars[3]
+    input <- pars[4]; a21 <- pars[5]; a32 <- pars[6]
+
+    # Enforce physical constraint: transfer rates < decomposition rates
+    if (a21 >= k1 || a32 >= k2) return(-1e10)
+
+    model <- run_3pool_model(k1, k2, k3, input, a21, a32,
+                             C0, F0_delta14C, years_model, atm_data)
+    if (is.null(model)) return(-1e10)
+
+    pred_C14 <- getF14_npool(model)[length(years_model), ]
+    pred_C   <- getC_npool(model)[length(years_model), ]
+
+    ll_C14 <- sum(
+      dnorm(pred_C14 - obs_2023$C14, 0, obs_2023$C14_sd, log = TRUE),
+      na.rm = TRUE
+    )
+    ll_C <- sum(
+      dnorm(pred_C - obs_2023$C_stock, 0, obs_2023$C_stock_sd, log = TRUE),
+      na.rm = TRUE
+    )
+
+    sum(ll_C14, ll_C)
+  }
+}
+
+# Sanity check on site 54
+ll_54 <- make_likelihood(
+  C0           = init_54$C_stock,
+  F0_delta14C  = F0_54,
+  obs_2023     = obs_54
+)
+cat("Test likelihood at plausible parameters:", ll_54(c(0.10, 0.01, 0.001, 0.4, 0.04, 0.003)), "\n")
+```
+
+
+# 8. Priors
+
+We use **uniform priors** with physically motivated bounds, the same approach as the CiPEHR tutorials. The bounds are informed by typical boreal SOC turnover times from the literature:
+
+| Parameter | Lower | Upper | Rationale |
+|-----------|-------|-------|-----------|
+| `k1` | 0.01 | 0.5 | Fast organic: 2-100 yr turnover |
+| `k2` | 0.001 | 0.1 | Stabilized organic: 10-1000 yr turnover |
+| `k3` | 0.0001 | 0.01 | Mineral: 100-10,000 yr turnover |
+| `input` | 0.01 | 5.0 | Boreal C inputs ~0.1-1 kg C m$^{-2}$ yr$^{-1}$ |
+| `a21` | 0 | 0.4 | Must be $< k_1$; enforced in likelihood |
+| `a32` | 0 | 0.08 | Must be $< k_2$; enforced in likelihood |
+
+```{r define-prior}
+par_names   <- c("k1", "k2", "k3", "input", "a21", "a32")
+prior_lower <- c(0.01,  0.001,  0.0001, 0.01, 0.0,  0.0)
+prior_upper <- c(0.5,   0.1,    0.01,   5.0,  0.4,  0.08)
+
+uniform_prior <- createUniformPrior(lower = prior_lower, upper = prior_upper)
+```
+
+
+# 9. MCMC: Site 54 (Spruce)
+
+We start with site 54, a spruce site with the most complete data (all horizons present in both years, largest carbon stocks). This gives us a detailed look at the full MCMC workflow before scaling to all sites.
+
+```{r mcmc-site54, cache=TRUE}
+result_54 <- run_and_summarize(
+  likelihood_fn = ll_54,
+  prior         = uniform_prior,
+  par_names     = par_names,
+  iterations    = 20000,
+  burn_in       = 5000,
+  thin          = 10
+)
+
+cat("Site 54 posterior summary:\n")
+print(result_54$summary)
+```
+
+## Convergence diagnostics
+
+```{r trace-plots-54, fig.height=8}
+ggplot(result_54$chain_df, aes(x = iteration, y = .data[[par_names[1]]], color = chain)) +
+  geom_line(alpha = 0.7, linewidth = 0.4) -> p_trace_k1
+
+# Build trace plots for all 6 parameters
+trace_plots <- lapply(par_names, function(par) {
+  ggplot(result_54$chain_df, aes(x = iteration, y = .data[[par]], color = chain)) +
+    geom_line(alpha = 0.6, linewidth = 0.3) +
+    labs(title = par, x = NULL, y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "none")
+})
+
+wrap_plots(trace_plots, ncol = 2) +
+  plot_annotation(title = "Trace plots: site 54 (spruce)",
+                  subtitle = "Chains should mix well and stabilize after the burn-in period")
+```
+
+```{r posterior-density-54, fig.height=7}
+density_plots <- lapply(par_names, function(par) {
+  ggplot(result_54$posterior_df, aes(x = .data[[par]])) +
+    geom_density(fill = "steelblue", alpha = 0.5, adjust = 1.5) +
+    geom_vline(xintercept = result_54$map[par], linetype = "dashed", color = "tomato") +
+    labs(title = par, x = NULL, y = "density") +
+    theme_minimal(base_size = 11)
+})
+
+wrap_plots(density_plots, ncol = 3) +
+  plot_annotation(
+    title = "Posterior distributions: site 54 (spruce)",
+    subtitle = "Dashed line = MAP estimate"
+  )
+```
+
+## Posterior predictive check
+
+The best test of the model is whether the posterior parameters reproduce the observations. We draw 200 samples from the posterior, run the model forward for each, and overlay the resulting trajectories on the data.
+
+```{r posterior-predictive-54, fig.height=7}
+n_draws <- 200
+draw_idx <- sample(nrow(result_54$posterior_df), n_draws)
+
+pred_list <- lapply(draw_idx, function(i) {
+  p <- as.numeric(result_54$posterior_df[i, ])
+  m <- run_3pool_model(p[1], p[2], p[3], p[4], p[5], p[6],
+                       C0 = init_54$C_stock, F0_delta14C = F0_54,
+                       times = seq(2005, 2023, by = 0.5), atm = atm_data)
+  if (is.null(m)) return(NULL)
+  data.frame(
+    year    = rep(seq(2005, 2023, by = 0.5), 3),
+    pool    = rep(pool_labels, each = length(seq(2005, 2023, by = 0.5))),
+    C14     = as.vector(getF14_npool(m)),
+    C_stock = as.vector(getC_npool(m)),
+    draw    = i
+  )
+})
+pred_df_54 <- bind_rows(pred_list) %>%
+  mutate(pool = factor(pool, levels = pool_labels))
+
+p_ppc_c14 <- ggplot() +
+  geom_line(data = pred_df_54, aes(x = year, y = C14, group = draw),
+            alpha = 0.07, color = "steelblue") +
+  geom_point(data = obs_54_plot, aes(x = year, y = C14), size = 3) +
+  geom_errorbar(data = obs_54_plot,
+                aes(x = year, ymin = C14 - C14_sd, ymax = C14 + C14_sd), width = 0.3) +
+  facet_wrap(~ pool, ncol = 1, scales = "free_y") +
+  labs(title = expression(paste("Posterior predictive: ", Delta^14, "C")),
+       x = "Year", y = expression(paste(Delta^14, "C (per mil)"))) +
+  theme_minimal(base_size = 12)
+
+p_ppc_cs <- ggplot() +
+  geom_line(data = pred_df_54, aes(x = year, y = C_stock, group = draw),
+            alpha = 0.07, color = "tomato") +
+  geom_point(data = obs_54_plot, aes(x = year, y = C_stock), size = 3) +
+  geom_errorbar(data = obs_54_plot,
+                aes(x = year, ymin = C_stock - C_stock_sd, ymax = C_stock + C_stock_sd), width = 0.3) +
+  facet_wrap(~ pool, ncol = 1, scales = "free_y") +
+  labs(title = "Posterior predictive: C stock",
+       x = "Year", y = expression(paste("C stock (kg C m"^-2, ")"))) +
+  theme_minimal(base_size = 12)
+
+p_ppc_c14 + p_ppc_cs
+```
+
+The shaded region shows the range of model trajectories consistent with the posterior. Well-fitting pools will have the observation points inside the envelope; pools where the model struggles will show gaps.
+
+
+# 10. Fitting All Six Sites
+
+Now we run the same MCMC workflow for all six sites. We write a helper that extracts initial conditions and 2023 observations for any site, builds the likelihood, and calls `run_and_summarize()`.
+
+```{r fit-all-sites, cache=TRUE}
+fit_site <- function(site_id) {
+  init <- dat_pools %>% filter(site == site_id, year == 2005) %>%
+    arrange(pool)
+  obs  <- dat_pools %>% filter(site == site_id, year == 2023) %>%
+    arrange(pool)
+  veg  <- unique(init$veg_traj)
+
+  # Initial Delta-14C: replace NA with atmospheric value at 2005
+  F0 <- ifelse(is.na(init$C14), atm_delta_2005, init$C14)
+
+  ll_fn <- make_likelihood(
+    C0          = init$C_stock,
+    F0_delta14C = F0,
+    obs_2023    = obs
+  )
+
+  result <- run_and_summarize(
+    likelihood_fn = ll_fn,
+    prior         = uniform_prior,
+    par_names     = par_names,
+    iterations    = 20000,
+    burn_in       = 5000,
+    thin          = 10
+  )
+
+  list(site = site_id, veg = veg, result = result)
+}
+
+all_sites  <- unique(dat_pools$site)
+all_fits   <- lapply(all_sites, fit_site)
+names(all_fits) <- all_sites
+
+cat("Completed fits for sites:", paste(all_sites, collapse = ", "), "\n")
+```
+
+## Summary of posterior estimates
+
+```{r summary-all-sites}
+summary_all <- bind_rows(lapply(all_fits, function(x) {
+  x$result$summary %>%
+    mutate(site = x$site, veg_traj = x$veg)
+})) %>%
+  select(veg_traj, site, parameter, median, lower_90, upper_90)
+
+knitr::kable(
+  summary_all %>% arrange(veg_traj, site, parameter),
+  digits = 4,
+  caption = "Posterior summaries (median, 90% credible interval) for all six sites"
+)
+```
+
+
+# 11. Comparing Spruce and Deciduous
+
+The key question is whether the posterior distributions for decomposition rates and carbon inputs differ between the two vegetation trajectories. We pool the posterior samples across sites within each vegetation type and compare.
+
+```{r compare-veg-types, fig.height=9}
+posterior_all <- bind_rows(lapply(all_fits, function(x) {
+  x$result$posterior_df %>%
+    mutate(site = x$site, veg_traj = x$veg)
+})) %>%
+  pivot_longer(cols = all_of(par_names), names_to = "parameter", values_to = "value") %>%
+  mutate(
+    parameter = factor(parameter, levels = par_names,
+                       labels = c(
+                         expression(paste("k"[1], " fast organic (yr"^-1, ")")),
+                         expression(paste("k"[2], " stabilized organic (yr"^-1, ")")),
+                         expression(paste("k"[3], " mineral (yr"^-1, ")")),
+                         expression(paste("input (kg C m"^-2, " yr"^-1, ")")),
+                         expression(paste("a"[21], " (yr"^-1, ")")),
+                         expression(paste("a"[32], " (yr"^-1, ")"))
+                       )),
+    veg_traj = factor(veg_traj, levels = c("spruce", "deciduous"))
+  )
+
+# Per-site median for MAP-style point estimates
+site_medians <- posterior_all %>%
+  group_by(veg_traj, site, parameter) %>%
+  summarise(median = median(value), .groups = "drop")
+
+ggplot(posterior_all, aes(x = value, fill = veg_traj, color = veg_traj)) +
+  geom_density(alpha = 0.35, adjust = 1.5) +
+  geom_rug(data = site_medians, aes(x = median, color = veg_traj),
+           inherit.aes = FALSE, length = unit(0.04, "npc"), linewidth = 0.8) +
+  facet_wrap(~ parameter, scales = "free", labeller = label_parsed, ncol = 2) +
+  scale_fill_manual(values  = c(spruce = "forestgreen", deciduous = "goldenrod")) +
+  scale_color_manual(values = c(spruce = "forestgreen", deciduous = "goldenrod")) +
+  labs(
+    title    = "Posterior distributions by vegetation type",
+    subtitle = "Densities pooled across sites within each veg type. Rug marks = per-site medians.",
+    x = "Parameter value", y = "Density",
+    fill = "Vegetation", color = "Vegetation"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom", strip.text = element_text(size = 10))
+```
+
+```{r compare-credible-intervals, fig.height=6}
+# Compute 90% CI per parameter per site for a point-range plot
+ci_all <- bind_rows(lapply(all_fits, function(x) {
+  x$result$summary %>%
+    mutate(site = as.character(x$site), veg_traj = x$veg)
+})) %>%
+  mutate(
+    parameter = factor(parameter, levels = par_names),
+    veg_traj  = factor(veg_traj, levels = c("spruce", "deciduous"))
+  )
+
+ggplot(ci_all, aes(x = median, y = site, color = veg_traj)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = lower_90, xmax = upper_90), height = 0.35) +
+  facet_wrap(~ parameter, scales = "free_x", ncol = 3) +
+  scale_color_manual(values = c(spruce = "forestgreen", deciduous = "goldenrod")) +
+  labs(
+    title    = "Per-site posteriors: median and 90% credible interval",
+    x = "Parameter value", y = "Site",
+    color = "Vegetation"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+
+# 12. Discussion
+
+A few things to look for when interpreting these results:
+
+**Decomposition rates ($k$):** If spruce and deciduous sites have overlapping posteriors for `k1` and `k2`, it suggests that the different plant communities have not yet produced measurable differences in organic matter decomposition after 18 years. If the distributions are separated, that points toward a plant-mediated effect on soil carbon cycling.
+
+**Carbon inputs:** Differences in `input` between vegetation types would reflect the different litter quantities and root inputs of spruce versus deciduous species, which have well-documented contrasts in above- and belowground productivity.
+
+**Transfer rates ($a_{21}$, $a_{32}$):** These control how fast decomposed carbon from upper pools is incorporated into lower pools. Large differences here would suggest that post-fire organic matter transformation rates differ between vegetation trajectories.
+
+**Wide posteriors:** If any parameter posteriors span much of the prior range, the data don't constrain that parameter well. This is most likely for `k3` (mineral), since very little change in the mineral pool occurs over 18 years -- the signal in the data is small relative to the measurement uncertainty.
+
+**Next steps:** The per-site approach here treats each site independently. A natural extension is a hierarchical model that explicitly estimates population-level mean parameters and between-site variance for each vegetation type, borrowing statistical strength across sites. This would give tighter posteriors and a cleaner comparison -- but it also requires more model complexity.

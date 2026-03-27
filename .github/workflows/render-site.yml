@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - 'EmmaBayesExample/**'
+      - 'BayesSoilCarbon_ACE.Rmd'
+      - 'dat.ace.horizons.csv'
       - '.github/workflows/render-site.yml'
   workflow_dispatch:
 
@@ -50,7 +52,7 @@ jobs:
 
       - name: Install R packages
         run: |
-          install.packages(c("rmarkdown", "deSolve", "ggplot2", "dplyr", "tidyr", "patchwork", "BayesianTools", "SoilR"), repos = "https://cloud.r-project.org")
+          install.packages(c("rmarkdown", "deSolve", "ggplot2", "dplyr", "tidyr", "patchwork", "BayesianTools", "SoilR", "readr"), repos = "https://cloud.r-project.org")
         shell: Rscript {0}
 
       - name: Render 1-pool tutorial
@@ -70,6 +72,16 @@ jobs:
             "EmmaBayesExample/BayesSoilCarbon_3Pool.Rmd",
             output_dir = "_site",
             output_file = "BayesSoilCarbon_3Pool.html"
+          )
+        shell: Rscript {0}
+
+      - name: Render ACE tutorial
+        timeout-minutes: 90
+        run: |
+          rmarkdown::render(
+            "BayesSoilCarbon_ACE.Rmd",
+            output_dir = "_site",
+            output_file = "BayesSoilCarbon_ACE.html"
           )
         shell: Rscript {0}
 
@@ -101,6 +113,10 @@ jobs:
               <li>
                 <a href="BayesSoilCarbon_3Pool.html">2. Three-Pool Tutorial</a>
                 <div class="desc">Extends the Bayesian workflow to a 3-pool series model with 6 parameters. Covers multi-pool dynamics, parameter correlations, and model comparison.</div>
+              </li>
+              <li>
+                <a href="BayesSoilCarbon_ACE.html">3. ACE Post-Fire Sites</a>
+                <div class="desc">Applies the 3-pool Bayesian framework to real post-fire data from black spruce sites in Alaska. Compares decomposition rates and carbon inputs between spruce and deciduous vegetation trajectories.</div>
               </li>
             </ul>
           </body>
