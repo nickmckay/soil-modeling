@@ -1,0 +1,849 @@
+---
+title: "Bayesian Glacier Reconstruction: Linear Regression with Age Uncertainty"
+author: "ACE/Stats-Modeling Seminar Spring 2026"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+
+# 1. Setup
+
+This tutorial introduces Bayesian inference using a **multiple linear regression** framework rather than the differential-equation soil carbon models in the earlier tutorials. The Bayesian machinery -- `BayesianTools`, `DREAMzs`, prior specification, likelihood, MCMC diagnostics -- is identical. What changes is the forward model: instead of solving ODEs, we evaluate a regression equation.
+
+The scientific problem is a classic one in paleoclimatology: we have a short, well-dated record of direct glacier observations from the 19th and 20th centuries, and a much longer but indirect sediment core record. Can we use the sediment proxies to reconstruct glacier extent over thousands of years?
+
+```{r load-libraries}
+library(BayesianTools)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+set.seed(123)
+```
+
+We reuse the same `run_and_summarize()` helper used throughout this tutorial series.
+
+```{r helper-function}
+run_and_summarize <- function(likelihood_fn, prior = NULL,
+                              prior_lower = NULL, prior_upper = NULL,
+                              par_names,
+                              iterations = 20000,
+                              burn_in = 5000, thin = 10) {
+
+  if (is.null(prior)) {
+    prior <- createUniformPrior(lower = prior_lower, upper = prior_upper)
+  }
+
+  bt_setup <- createBayesianSetup(
+    likelihood = likelihood_fn,
+    prior      = prior,
+    names      = par_names
+  )
+
+  mcmc_out <- runMCMC(
+    bayesianSetup = bt_setup,
+    sampler       = "DREAMzs",
+    settings      = list(iterations = iterations, message = FALSE)
+  )
+
+  raw_chains <- getSample(mcmc_out, start = 1, coda = TRUE, parametersOnly = FALSE)
+  chain_df <- do.call(rbind, lapply(seq_along(raw_chains), function(i) {
+    ch <- as.data.frame(as.matrix(raw_chains[[i]]))
+    n_par <- length(par_names)
+    colnames(ch)[1:n_par] <- par_names
+    ch$log_posterior <- ch[, n_par + 1]
+    ch <- ch[, c(par_names, "log_posterior")]
+    ch$iteration <- seq_len(nrow(ch))
+    ch$chain <- factor(i)
+    ch
+  }))
+
+  samples <- getSample(mcmc_out, start = burn_in, thin = thin)
+  colnames(samples) <- par_names
+  posterior_df <- as.data.frame(samples)
+
+  map_est <- MAP(mcmc_out, start = burn_in)$parametersMAP
+  names(map_est) <- par_names
+
+  summary_tbl <- posterior_df %>%
+    pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+    group_by(parameter) %>%
+    summarise(
+      median   = median(value),
+      lower_90 = quantile(value, 0.05),
+      upper_90 = quantile(value, 0.95),
+      .groups  = "drop"
+    )
+
+  list(
+    mcmc_out     = mcmc_out,
+    chain_df     = chain_df,
+    posterior_df = posterior_df,
+    map          = map_est,
+    summary      = summary_tbl,
+    burn_in      = burn_in,
+    thin         = thin
+  )
+}
+```
+
+
+# 2. Scientific Background
+
+## The calibration-reconstruction problem
+
+Glaciers respond to climate. When climate cools, glaciers advance and cover more of the landscape; when it warms, they retreat. Sediment deposited in lakes or fjords near glaciers records this history: glacially derived sediments are denser, coarser, and have higher Ca/Fe ratios (fresh, unweathered rock flour dominates over chemically weathered material).
+
+The challenge is that we can only directly measure glacier extent -- from photographs, maps, and terminus surveys -- for roughly the past 150 years. The sediment core record extends much further back, potentially thousands of years, but does not directly measure glacier coverage. It records proxies.
+
+This tutorial demonstrates **Bayesian calibration and reconstruction**:
+
+1. **Calibrate**: Use the 10 historical glacier observations (19th and 20th century) to estimate the statistical relationship between glacier coverage and sediment proxies.
+2. **Reconstruct**: Apply that relationship to the full 4000-year sediment core to infer past glacier extent.
+
+## The sediment proxies
+
+Each sediment proxy has a physically motivated expected sign:
+
+| Variable | Abbreviation | Units | Expected sign | Reasoning |
+|----------|-------------|-------|---------------|-----------|
+| Wet bulk density | WBD | g cm$^{-3}$ (standardized) | **positive** | Glacial flour is dense; higher WBD during advance |
+| Sedimentation rate | SedRate | cm yr$^{-1}$ (standardized) | **positive** | More sediment delivered when glacier is large |
+| Grain size | GrainSize | $\mu$m (standardized) | **positive** | Glacial transport produces coarser particles |
+| Ca/Fe ratio | CaFe | ratio (standardized) | **positive** | Fresh, unweathered minerals (Ca-rich) dominate glacial input; Fe enrichment reflects weathered, non-glacial material |
+
+These sign expectations are the basis for our **sign-constrained priors**, which we discuss in detail in Section 7.
+
+## Why an autoregressive term?
+
+Glaciers do not respond instantaneously to climate or sediment supply signals. A large glacier this year is likely to be a large glacier next year -- glacier extent is persistent, or autocorrelated through time. Ignoring this would make the model's residuals autocorrelated, violating the independence assumption of ordinary regression and producing overconfident (too narrow) confidence intervals.
+
+The autoregressive (AR) term $\varphi \cdot G_{t-1}$ captures this persistence explicitly: today's glacier extent depends on yesterday's, plus the sediment proxy signals, plus random noise.
+
+## Age uncertainty
+
+Historical glacier observations come with varying degrees of temporal precision:
+
+- **Modern observations** (late 20th century) from aerial photography and GPS: age uncertainty of 1-3 years.
+- **19th century observations** from expedition reports and early photographs: age uncertainty of 10-20 years.
+
+If the glacier was changing rapidly, a 20-year age error could shift the predicted glacier extent by 5-15 percentage points -- larger than typical measurement error. We model this explicitly in the likelihood.
+
+
+# 3. Fake Data
+
+Since we are building a tutorial, we generate synthetic data with known true parameters. This lets us verify at the end that the MCMC recovered what we put in.
+
+## Sediment core (100 samples, 0--4000 yr BP)
+
+The core is sampled at roughly 40-year resolution, covering the full Holocene.
+All covariates are **standardized** (mean 0, SD 1), which is standard practice
+in regression to make coefficient magnitudes directly comparable.
+
+```{r generate-core-data}
+n_core    <- 100
+core_ages <- round(seq(4000, 0, length.out = n_core))
+# Index 1 = oldest (4000 yr BP), index 100 = modern (0 yr BP)
+
+# Shared glacial climate signal with multi-centennial and millennial oscillations
+glacial_signal <- sin(2 * pi * core_ages / 1000) +
+                  0.4 * sin(2 * pi * core_ages / 300) +
+                  0.2 * rnorm(n_core)
+glacial_signal <- as.numeric(scale(glacial_signal))
+
+# Sediment covariates: each correlated with the glacial signal + AR noise
+ar_noise <- function(n, ar_coef) as.numeric(arima.sim(list(ar = ar_coef), n = n))
+
+WBD       <- as.numeric(scale(0.7 * glacial_signal + 0.3 * ar_noise(n_core, 0.6)))
+SedRate   <- as.numeric(scale(0.6 * glacial_signal + 0.4 * ar_noise(n_core, 0.5)))
+GrainSize <- as.numeric(scale(0.8 * glacial_signal + 0.2 * ar_noise(n_core, 0.4)))
+CaFe      <- as.numeric(scale(0.5 * glacial_signal + 0.5 * ar_noise(n_core, 0.3)))
+
+core_df <- data.frame(
+  age       = core_ages,
+  WBD       = WBD,
+  SedRate   = SedRate,
+  GrainSize = GrainSize,
+  CaFe      = CaFe
+)
+```
+
+## True glacier history
+
+We simulate a 4000-year glacier record using the AR(1) regression model with known
+("true") parameters. In a real study, this is what we are trying to recover.
+
+```{r generate-true-glacier}
+# True parameter values used to generate the data
+true_pars <- c(b0 = 15, b1 = 8, b2 = 5, b3 = 4, b4 = 6, phi = 0.75, sigma = 6)
+
+cat("True parameters:\n")
+print(true_pars)
+
+G_true    <- numeric(n_core)
+G_true[1] <- 55  # initial glacier coverage at 4000 yr BP (%)
+
+for (t in 2:n_core) {
+  mu       <- true_pars["b0"] +
+              true_pars["b1"] * WBD[t] +
+              true_pars["b2"] * SedRate[t] +
+              true_pars["b3"] * GrainSize[t] +
+              true_pars["b4"] * CaFe[t] +
+              true_pars["phi"] * G_true[t - 1]
+  G_true[t] <- pmax(0, pmin(100, mu + rnorm(1, 0, true_pars["sigma"])))
+}
+
+core_df$G_true <- G_true
+```
+
+## Glacier observations (10 points, 0--150 yr BP)
+
+The 10 historical observations span the 19th and 20th centuries. Each has a measurement uncertainty and a growing age uncertainty going further back in time.
+
+```{r generate-obs}
+# Observation ages (yr BP), ordered oldest to youngest
+obs_ages <- c(150, 135, 120, 105, 90, 75, 60, 40, 20, 5)
+n_obs    <- length(obs_ages)
+
+# Interpolate true glacier coverage to obs ages
+# (approx requires increasing x, so reverse the decreasing core_ages)
+interp_core <- function(vals, to_ages) {
+  approx(rev(core_ages), rev(vals), xout = to_ages)$y
+}
+
+G_obs_true <- interp_core(G_true, obs_ages)
+
+# Add measurement noise
+sigma_meas <- 3   # % glacier coverage
+G_obs      <- pmax(0, pmin(100, G_obs_true + rnorm(n_obs, 0, sigma_meas)))
+
+# Age uncertainties: grow linearly back in time
+sigma_age  <- 2 + 0.12 * obs_ages   # yr; ranges from ~2 yr (modern) to ~20 yr (1850 CE)
+
+# Effective observation uncertainty: combines measurement error and age error
+# Age error propagates through the rate of change of glacier coverage
+avg_dG_dt  <- mean(abs(diff(G_obs_true)) / abs(diff(obs_ages)))  # %/yr
+sigma_eff  <- sqrt(sigma_meas^2 + (sigma_age * avg_dG_dt)^2)
+
+obs_df <- data.frame(
+  age       = obs_ages,
+  year_CE   = 2000 - obs_ages,
+  G_obs     = G_obs,
+  G_true    = G_obs_true,
+  sigma_age = sigma_age,
+  sigma_eff = sigma_eff
+)
+
+knitr::kable(obs_df %>% select(year_CE, age, G_obs, G_true, sigma_age, sigma_eff),
+             digits = 1,
+             col.names = c("Year CE", "Age (yr BP)", "G observed (%)",
+                           "G true (%)", "Age uncertainty (yr)", "Eff. uncertainty (%)"),
+             caption = "Synthetic glacier observations. True values are shown for verification only.")
+```
+
+## Visualizing both datasets
+
+```{r plot-data, fig.height=7}
+p_core <- core_df %>%
+  pivot_longer(cols = c(WBD, SedRate, GrainSize, CaFe),
+               names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(variable,
+                           levels = c("WBD", "SedRate", "GrainSize", "CaFe"),
+                           labels = c("Wet bulk density", "Sed. rate",
+                                      "Grain size", "Ca/Fe"))) %>%
+  ggplot(aes(x = age, y = value)) +
+  geom_line(color = "steelblue", linewidth = 0.7) +
+  scale_x_reverse(name = "Age (yr BP)") +
+  facet_wrap(~ variable, ncol = 1, scales = "free_y") +
+  labs(title = "Sediment core proxies (4000-yr record)",
+       y = "Standardized value") +
+  theme_minimal(base_size = 11)
+
+p_glacier <- ggplot() +
+  geom_line(data = core_df, aes(x = age, y = G_true),
+            color = "grey70", linewidth = 0.8) +
+  geom_point(data = obs_df, aes(x = age, y = G_obs), size = 3, color = "tomato") +
+  geom_errorbar(data = obs_df,
+                aes(x = age, ymin = G_obs - sigma_eff, ymax = G_obs + sigma_eff),
+                width = 5, color = "tomato") +
+  scale_x_reverse(name = "Age (yr BP)") +
+  labs(title = "Glacier coverage: true history (grey) + observations (red)",
+       subtitle = "Error bars show effective uncertainty (measurement + age uncertainty)",
+       y = "Glacier coverage (%)") +
+  theme_minimal(base_size = 11)
+
+p_core / p_glacier + plot_layout(heights = c(2, 1))
+```
+
+The grey line shows the true simulated glacier history (which we know only because this is fake data). The red points are what we actually "observe." Notice that:
+
+- The observations cover only the rightmost ~150 years of the 4000-year core record.
+- Error bars are larger for older observations, reflecting growing age uncertainty.
+- The sediment proxies show multi-centennial oscillations that track glacier advance and retreat.
+
+
+# 4. The Model
+
+## Equation
+
+The model predicts glacier coverage $G$ at time $t$ as a linear combination of the four sediment proxies plus an autoregressive term on the previous observation:
+
+$$G_t = \beta_0 + \beta_1 \cdot \text{WBD}_t + \beta_2 \cdot \text{SedRate}_t + \beta_3 \cdot \text{GrainSize}_t + \beta_4 \cdot \text{CaFe}_t + \varphi \cdot G_{t-1} + \varepsilon_t$$
+
+$$\varepsilon_t \sim \mathcal{N}(0,\, \sigma^2)$$
+
+This is a standard AR(1) regression. The parameters are:
+
+| Symbol | Name | Role |
+|--------|------|------|
+| $\beta_0$ | Intercept | Baseline glacier coverage when all predictors and lagged G are zero |
+| $\beta_1$--$\beta_4$ | Regression coefficients | Effect of each proxy on glacier coverage |
+| $\varphi$ | AR coefficient | How much of last period's glacier coverage persists |
+| $\sigma$ | Process noise | Unexplained variability not captured by the predictors |
+
+## Calibration vs. reconstruction
+
+**During calibration**, we use the 10 historical glacier observations. For each observation $i$, we predict:
+
+$$\hat{G}_i = \beta_0 + \boldsymbol{\beta} \cdot \mathbf{x}_i + \varphi \cdot G_{i-1}^{\text{obs}}$$
+
+where $\mathbf{x}_i$ is the vector of covariate values interpolated from the sediment core to observation age $i$, and $G_{i-1}^{\text{obs}}$ is the **observed** glacier coverage at the previous (older) time point. Conditioning on the observed previous value -- rather than the predicted one -- is appropriate when observations are sparse and we want each data point to contribute independently to constraining the parameters.
+
+**During reconstruction**, we do not have observed $G$ at each step, so we chain predictions together:
+
+$$\hat{G}_t^{\text{recon}} = \beta_0 + \boldsymbol{\beta} \cdot \mathbf{x}_t + \varphi \cdot \hat{G}_{t-1}^{\text{recon}}$$
+
+This propagates uncertainty through the entire 4000-year record.
+
+## Age uncertainty in the likelihood
+
+The effective observation uncertainty $\sigma_{\text{eff},i}$ combines two sources:
+
+$$\sigma_{\text{eff},i} = \sqrt{\sigma_{\text{meas}}^2 + \left(\sigma_{\text{age},i} \cdot \overline{\left|\frac{dG}{dt}\right|}\right)^2}$$
+
+where $\sigma_{\text{meas}}$ is the precision of the glacier area measurement (3%), $\sigma_{\text{age},i}$ is the age uncertainty for observation $i$, and $\overline{|dG/dt|}$ is the average rate of glacier change estimated from the data. The model's own residual noise $\sigma$ adds in quadrature: total uncertainty $= \sqrt{\sigma^2 + \sigma_{\text{eff},i}^2}$.
+
+```{r setup-covariates-at-obs}
+# Interpolate all four covariates at the 10 observation ages
+WBD_obs       <- interp_core(WBD,       obs_ages)
+SedRate_obs   <- interp_core(SedRate,   obs_ages)
+GrainSize_obs <- interp_core(GrainSize, obs_ages)
+CaFe_obs      <- interp_core(CaFe,      obs_ages)
+
+cat(sprintf("Average glacier rate of change in calibration window: %.2f %%/yr\n", avg_dG_dt))
+cat("Effective observation uncertainties (%):\n")
+print(round(sigma_eff, 1))
+```
+
+
+# 5. Forward Model Demo
+
+Before fitting, let's run the calibration model forward at a few hand-picked parameter sets. This builds intuition for how each parameter controls the predictions, and shows why no single guess perfectly fits the data.
+
+```{r forward-demo, fig.height=5}
+predict_at_obs <- function(b0, b1, b2, b3, b4, phi) {
+  G_pred    <- numeric(n_obs)
+  G_pred[1] <- b0 + b1*WBD_obs[1] + b2*SedRate_obs[1] +
+                b3*GrainSize_obs[1] + b4*CaFe_obs[1]
+  for (i in 2:n_obs) {
+    G_pred[i] <- b0 + b1*WBD_obs[i] + b2*SedRate_obs[i] +
+                  b3*GrainSize_obs[i] + b4*CaFe_obs[i] +
+                  phi * G_obs[i - 1]
+  }
+  G_pred
+}
+
+demo_scenarios <- list(
+  list(b0=20, b1=10, b2=6, b3=5, b4=8, phi=0.80, label="Strong proxies, high persistence"),
+  list(b0=30, b1=4,  b2=2, b3=2, b4=3, phi=0.50, label="Weak proxies, low persistence"),
+  list(b0=15, b1=8,  b2=5, b3=4, b4=6, phi=0.75, label="True parameters")
+)
+
+demo_df <- bind_rows(lapply(demo_scenarios, function(s) {
+  data.frame(
+    age      = obs_ages,
+    G_pred   = predict_at_obs(s$b0, s$b1, s$b2, s$b3, s$b4, s$phi),
+    scenario = s$label
+  )
+}))
+
+ggplot() +
+  geom_point(data = obs_df, aes(x = age, y = G_obs), size = 4, color = "black") +
+  geom_errorbar(data = obs_df,
+                aes(x = age, ymin = G_obs - sigma_eff, ymax = G_obs + sigma_eff),
+                width = 3, color = "black") +
+  geom_line(data = demo_df, aes(x = age, y = G_pred, color = scenario, linetype = scenario),
+            linewidth = 1) +
+  geom_point(data = demo_df, aes(x = age, y = G_pred, color = scenario),
+             size = 2, shape = 1) +
+  scale_x_reverse(name = "Age (yr BP)") +
+  scale_color_manual(values = c("steelblue", "goldenrod", "tomato")) +
+  labs(title = "Forward model predictions at hand-picked parameter sets",
+       subtitle = "Black points = observations. Red line = true parameters.",
+       y = "Glacier coverage (%)",
+       color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+The "true parameters" scenario (red) fits reasonably well but not perfectly -- the residual noise $\sigma = 6\%$ means even the data-generating model doesn't match exactly.
+
+
+# 6. The Likelihood Function
+
+The likelihood answers: given parameter values $\boldsymbol{\theta}$, how probable are the 10 observations we have?
+
+We assume that each observation's residual is normally distributed around the model prediction, with total uncertainty $\sqrt{\sigma^2 + \sigma_{\text{eff},i}^2}$:
+
+$$\log L(\boldsymbol{\theta}) = \sum_{i=1}^{10} \log \mathcal{N}\!\left(G_i^{\text{obs}} \,\middle|\, \hat{G}_i(\boldsymbol{\theta}),\; \sigma^2 + \sigma_{\text{eff},i}^2 \right)$$
+
+```{r define-likelihood}
+likelihood_fn <- function(pars) {
+  b0    <- pars[1]; b1 <- pars[2]; b2 <- pars[3]
+  b3    <- pars[4]; b4 <- pars[5]
+  phi   <- pars[6]; sigma <- pars[7]
+
+  # AR(1) predictions at calibration observation ages
+  # Condition on the OBSERVED G at the previous time step (conditional likelihood)
+  G_pred    <- numeric(n_obs)
+  G_pred[1] <- b0 + b1*WBD_obs[1] + b2*SedRate_obs[1] +
+                b3*GrainSize_obs[1] + b4*CaFe_obs[1]
+  for (i in 2:n_obs) {
+    G_pred[i] <- b0 + b1*WBD_obs[i] + b2*SedRate_obs[i] +
+                  b3*GrainSize_obs[i] + b4*CaFe_obs[i] +
+                  phi * G_obs[i - 1]
+  }
+
+  # Total uncertainty: model residual + observational uncertainty
+  total_sigma <- sqrt(sigma^2 + sigma_eff^2)
+
+  sum(dnorm(G_obs, G_pred, total_sigma, log = TRUE))
+}
+
+# Sanity check: log-likelihood at true parameters should be high
+cat("Log-likelihood at true parameters:",
+    likelihood_fn(true_pars), "\n")
+
+# Compare to a bad guess
+cat("Log-likelihood at poor guess:",
+    likelihood_fn(c(50, 1, 1, 1, 1, 0.1, 15)), "\n")
+```
+
+The true parameters should produce a considerably higher (less negative) log-likelihood than a poor guess.
+
+## Visualizing the likelihood surface
+
+With 7 parameters we can't plot the full likelihood, but we can take a 2D slice to build intuition. Let's fix all parameters at their true values and vary $\beta_1$ and $\varphi$:
+
+```{r likelihood-slice, fig.height=4}
+b1_grid  <- seq(0, 20,  length.out = 60)
+phi_grid <- seq(0, 0.99, length.out = 60)
+grid_df  <- expand.grid(b1 = b1_grid, phi = phi_grid)
+
+grid_df$ll <- apply(grid_df, 1, function(row) {
+  pars      <- true_pars
+  pars["b1"] <- row["b1"]
+  pars["phi"] <- row["phi"]
+  likelihood_fn(pars)
+})
+
+grid_df$ll_plot <- pmax(grid_df$ll, max(grid_df$ll) - 20)
+
+ggplot(grid_df, aes(x = b1, y = phi, fill = ll_plot)) +
+  geom_raster() +
+  geom_vline(xintercept = true_pars["b1"],  linetype = "dashed", color = "white") +
+  geom_hline(yintercept = true_pars["phi"], linetype = "dashed", color = "white") +
+  scale_fill_viridis_c(option = "inferno", name = "Log-likelihood") +
+  labs(title = expression(paste("Likelihood surface: ", beta[1], " vs. ", varphi)),
+       subtitle = "White dashes = true values. All other parameters fixed at true values.",
+       x = expression(paste(beta[1], " (WBD coefficient)")),
+       y = expression(paste(varphi, " (AR coefficient)"))) +
+  theme_minimal(base_size = 13)
+```
+
+The brightest region (highest likelihood) is near the true values, as expected. Notice that $\beta_1$ and $\varphi$ are somewhat correlated -- a strong proxy signal can be partially compensated by stronger persistence, and vice versa. MCMC explores this full joint surface.
+
+
+# 7. Priors
+
+## Why sign-constrained priors?
+
+We have strong scientific reasons to expect specific signs for each coefficient. Using sign-constrained uniform priors encodes this knowledge without being more prescriptive than necessary.
+
+For example: it would be physically implausible for higher wet bulk density to be associated with *less* glacier coverage. Allowing negative values for $\beta_1$ would waste posterior probability in a region of parameter space that contradicts our understanding of the system. The prior rules it out.
+
+```{r define-priors}
+par_names   <- c("b0", "b1", "b2", "b3", "b4", "phi", "sigma")
+
+# Bounds encode sign constraints and plausible ranges
+prior_lower <- c(b0 = -20,  b1 = 0,   b2 = 0,  b3 = 0,  b4 = 0,  phi = 0,    sigma = 0.5)
+prior_upper <- c(b0 =  80,  b1 = 30,  b2 = 30, b3 = 20, b4 = 20, phi = 0.99, sigma = 25)
+
+uniform_prior <- createUniformPrior(lower = prior_lower, upper = prior_upper)
+```
+
+## Visualizing the priors
+
+```{r plot-priors, fig.height=6}
+prior_df <- data.frame(
+  parameter = factor(par_names,
+                     levels = par_names,
+                     labels = c(expression(beta[0]),
+                                expression(beta[1]~"(WBD)"),
+                                expression(beta[2]~"(SedRate)"),
+                                expression(beta[3]~"(GrainSize)"),
+                                expression(beta[4]~"(Ca/Fe)"),
+                                expression(varphi~"(AR)"),
+                                expression(sigma))),
+  lower = prior_lower,
+  upper = prior_upper,
+  true  = true_pars
+)
+
+ggplot(prior_df, aes(xmin = lower, xmax = upper, y = parameter)) +
+  geom_segment(aes(x = lower, xend = upper, yend = parameter),
+               linewidth = 8, color = "steelblue", alpha = 0.4) +
+  geom_point(aes(x = true), size = 4, color = "tomato") +
+  labs(title = "Uniform prior ranges (blue bars) and true parameter values (red dots)",
+       subtitle = "All priors are sign-constrained based on physical reasoning",
+       x = "Parameter value", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_text(size = 11))
+```
+
+The true values (red) all fall well within their respective prior ranges -- a necessary check before fitting. Note that $\beta_1$--$\beta_4$ and $\varphi$ are all strictly positive, while $\beta_0$ allows a small negative range to accommodate sites where glacier coverage could approach zero.
+
+## What if we didn't constrain the signs?
+
+Suppose we used flat priors over $(-30, 30)$ for all regression coefficients. The MCMC could explore solutions where WBD has a *negative* relationship with glacier extent. These solutions may fit the 10 data points nearly as well as the sign-correct solution -- the data alone are insufficient to rule them out. Sign constraints prevent the sampler from getting stuck in these physically meaningless regions, improving both convergence speed and interpretability.
+
+
+# 8. Running the MCMC
+
+```{r run-mcmc}
+result <- run_and_summarize(
+  likelihood_fn = likelihood_fn,
+  prior         = uniform_prior,
+  par_names     = par_names,
+  iterations    = 20000,
+  burn_in       = 5000,
+  thin          = 10
+)
+
+cat("Posterior summary:\n")
+print(result$summary)
+```
+
+
+# 9. Convergence Diagnostics
+
+Before trusting the posterior, we need to check that the MCMC chains have converged -- that they are exploring the posterior distribution rather than still searching for it.
+
+## Trace plots
+
+In a well-converged chain, the trace should look like "white noise" -- stationary, well-mixed, with no long-term trends or sudden jumps. The **burn-in** period (the first part of the chain, discarded before posterior summaries) covers the time before the chain reaches stationarity.
+
+```{r trace-plots, fig.height=9}
+trace_plots <- lapply(par_names, function(par) {
+  ylab_expr <- switch(par,
+    b0 = expression(beta[0]),
+    b1 = expression(beta[1]),
+    b2 = expression(beta[2]),
+    b3 = expression(beta[3]),
+    b4 = expression(beta[4]),
+    phi = expression(varphi),
+    sigma = expression(sigma)
+  )
+  ggplot(result$chain_df, aes(x = iteration, y = .data[[par]], color = chain)) +
+    geom_line(alpha = 0.6, linewidth = 0.3) +
+    geom_vline(xintercept = result$burn_in, linetype = "dashed", color = "black") +
+    labs(title = par, x = NULL, y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "none")
+})
+
+wrap_plots(trace_plots, ncol = 2) +
+  plot_annotation(
+    title = "Trace plots: MCMC chains for all 7 parameters",
+    subtitle = "Dashed line = burn-in cutoff. Post-burn-in samples are used for inference."
+  )
+```
+
+Look for:
+
+- **Good mixing**: The chains (colored lines) should overlap and crisscross frequently.
+- **Stationarity**: No sustained upward or downward drift after burn-in.
+- **Multiple chains agreeing**: All three DREAMzs chains should converge to the same region.
+
+If a parameter's trace shows a long run in one direction before settling, you may need to extend the burn-in or run more iterations.
+
+## Log-posterior trace
+
+```{r logpost-trace, fig.height=3}
+ggplot(result$chain_df, aes(x = iteration, y = log_posterior, color = chain)) +
+  geom_line(alpha = 0.6, linewidth = 0.3) +
+  geom_vline(xintercept = result$burn_in, linetype = "dashed") +
+  labs(title = "Log-posterior over iterations",
+       subtitle = "Should plateau after burn-in, indicating the chains found the high-probability region",
+       x = "Iteration", y = "Log-posterior") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+
+# 10. Posterior Analysis
+
+## Posterior densities
+
+```{r posterior-densities, fig.height=8}
+par_labels <- c(
+  b0    = expression(beta[0]~"(intercept)"),
+  b1    = expression(beta[1]~"(WBD)"),
+  b2    = expression(beta[2]~"(SedRate)"),
+  b3    = expression(beta[3]~"(GrainSize)"),
+  b4    = expression(beta[4]~"(Ca/Fe)"),
+  phi   = expression(varphi~"(AR coefficient)"),
+  sigma = expression(sigma~"(process noise)")
+)
+
+dens_plots <- lapply(par_names, function(par) {
+  truth_val <- true_pars[par]
+  ggplot(result$posterior_df, aes(x = .data[[par]])) +
+    geom_density(fill = "steelblue", alpha = 0.4, adjust = 1.5) +
+    geom_vline(xintercept = result$map[par],  linetype = "dashed", color = "tomato",   linewidth = 0.8) +
+    geom_vline(xintercept = truth_val,         linetype = "solid",  color = "forestgreen", linewidth = 0.8) +
+    labs(title = par, x = NULL, y = "Density") +
+    theme_minimal(base_size = 10)
+})
+
+wrap_plots(dens_plots, ncol = 3) +
+  plot_annotation(
+    title    = "Posterior distributions (blue = density, red dashed = MAP, green = true value)",
+    subtitle = "True values should fall within the posterior mass if the model and data are consistent"
+  )
+```
+
+## Recovery of true values
+
+```{r recovery-table}
+recovery_df <- result$summary %>%
+  mutate(
+    true_value = true_pars[parameter],
+    recovered  = true_value >= lower_90 & true_value <= upper_90
+  ) %>%
+  select(parameter, true_value, median, lower_90, upper_90, recovered)
+
+knitr::kable(recovery_df, digits = 2,
+             col.names = c("Parameter", "True value", "Posterior median",
+                           "90% CI lower", "90% CI upper", "True value in 90% CI?"),
+             caption = "Posterior recovery of true parameters")
+```
+
+With only 10 observations and 7 parameters, some posteriors will be wide. This is expected -- the data are genuinely limited. Wide posteriors are not a failure of the method; they are an honest representation of what the data can and cannot tell us. Parameters with narrower posteriors are better constrained by the calibration data.
+
+
+# 11. Posterior Predictive Check
+
+Does the fitted model actually reproduce the 10 calibration observations? We draw 200 samples from the posterior and generate predictions for each, then check whether the observations fall within the prediction envelope.
+
+```{r posterior-predictive, fig.height=4}
+n_draws <- 200
+draw_idx <- sample(nrow(result$posterior_df), n_draws)
+
+pred_draws <- do.call(rbind, lapply(draw_idx, function(i) {
+  p     <- as.numeric(result$posterior_df[i, ])
+  G_p   <- numeric(n_obs)
+  G_p[1] <- p[1] + p[2]*WBD_obs[1] + p[3]*SedRate_obs[1] +
+             p[4]*GrainSize_obs[1] + p[5]*CaFe_obs[1]
+  for (j in 2:n_obs) {
+    G_p[j] <- p[1] + p[2]*WBD_obs[j] + p[3]*SedRate_obs[j] +
+               p[4]*GrainSize_obs[j] + p[5]*CaFe_obs[j] +
+               p[6] * G_obs[j - 1]
+  }
+  data.frame(age = obs_ages, G_pred = G_p, draw = i)
+}))
+
+ggplot() +
+  geom_line(data = pred_draws, aes(x = age, y = G_pred, group = draw),
+            alpha = 0.06, color = "steelblue") +
+  geom_point(data = obs_df, aes(x = age, y = G_obs), size = 4, color = "black") +
+  geom_errorbar(data = obs_df,
+                aes(x = age, ymin = G_obs - sigma_eff, ymax = G_obs + sigma_eff),
+                width = 3, color = "black") +
+  scale_x_reverse(name = "Age (yr BP)") +
+  labs(title = "Posterior predictive check: 200 posterior draws vs. calibration observations",
+       subtitle = "Observations should fall within the blue envelope if the model fits well",
+       y = "Glacier coverage (%)") +
+  theme_minimal(base_size = 13)
+```
+
+If observations consistently fall outside the envelope, it suggests model misspecification -- perhaps a missing predictor, a non-linear relationship, or underestimated uncertainty.
+
+
+# 12. The 4000-Year Reconstruction
+
+This is the scientific payoff. We now apply the fitted model to the full sediment core record to reconstruct glacier extent over 4000 years. Because we chain AR predictions from oldest to youngest, uncertainty accumulates going further back in time.
+
+```{r reconstruct, fig.height=5}
+# Helper: run the AR(1) model forward over the full core
+reconstruct <- function(pars) {
+  b0 <- pars[1]; b1 <- pars[2]; b2 <- pars[3]
+  b3 <- pars[4]; b4 <- pars[5]; phi <- pars[6]
+
+  G_r    <- numeric(n_core)
+  G_r[1] <- b0 / (1 - phi)   # approximate steady-state as starting value
+
+  for (t in 2:n_core) {
+    G_r[t] <- b0 + b1*WBD[t] + b2*SedRate[t] +
+               b3*GrainSize[t] + b4*CaFe[t] +
+               phi * G_r[t - 1]
+  }
+  pmax(0, pmin(100, G_r))
+}
+
+# Reconstruction from 200 posterior draws
+recon_draws <- do.call(rbind, lapply(draw_idx, function(i) {
+  p   <- as.numeric(result$posterior_df[i, ])
+  G_r <- reconstruct(p)
+  data.frame(age = core_ages, G_recon = G_r, draw = i)
+}))
+
+# Summarise: median and 90% interval across draws at each age
+recon_summary <- recon_draws %>%
+  group_by(age) %>%
+  summarise(
+    median   = median(G_recon),
+    lower_90 = quantile(G_recon, 0.05),
+    upper_90 = quantile(G_recon, 0.95),
+    .groups  = "drop"
+  )
+
+ggplot() +
+  geom_ribbon(data = recon_summary,
+              aes(x = age, ymin = lower_90, ymax = upper_90),
+              fill = "steelblue", alpha = 0.3) +
+  geom_line(data = recon_summary, aes(x = age, y = median),
+            color = "steelblue", linewidth = 1) +
+  geom_line(data = core_df, aes(x = age, y = G_true),
+            color = "grey60", linewidth = 0.6, linetype = "dashed") +
+  geom_point(data = obs_df, aes(x = age, y = G_obs), size = 3, color = "tomato") +
+  geom_errorbar(data = obs_df,
+                aes(x = age, ymin = G_obs - sigma_eff, ymax = G_obs + sigma_eff),
+                width = 20, color = "tomato") +
+  scale_x_reverse(name = "Age (yr BP)") +
+  labs(title = "4000-year glacier reconstruction",
+       subtitle = "Blue = posterior median + 90% interval; dashed grey = true history; red = observations",
+       y = "Glacier coverage (%)") +
+  theme_minimal(base_size = 13)
+```
+
+Several features to notice:
+
+- The reconstruction **matches the observations** (calibration period) closely where data exist.
+- The uncertainty **widens going back in time**: each chained AR step introduces additional uncertainty, and we are further from the anchoring effect of the observations.
+- The reconstruction **follows the broad glacial oscillations** in the sediment proxies, even thousands of years before any direct observations.
+- Where the true history (dashed) falls outside the 90% interval, it reveals limitations of the model -- perhaps the relationship between proxies and glacier extent was non-stationary over 4000 years, which this model cannot capture.
+
+
+# 13. What Does the AR Term Do?
+
+To understand the value of the AR term, we refit without it (setting $\varphi = 0$) and compare.
+
+```{r fit-no-ar}
+likelihood_no_ar <- function(pars) {
+  b0    <- pars[1]; b1 <- pars[2]; b2 <- pars[3]
+  b3    <- pars[4]; b4 <- pars[5]; sigma <- pars[6]
+
+  G_pred <- b0 + b1*WBD_obs + b2*SedRate_obs + b3*GrainSize_obs + b4*CaFe_obs
+
+  total_sigma <- sqrt(sigma^2 + sigma_eff^2)
+  sum(dnorm(G_obs, G_pred, total_sigma, log = TRUE))
+}
+
+result_no_ar <- run_and_summarize(
+  likelihood_fn = likelihood_no_ar,
+  prior_lower   = c(prior_lower[1:5], prior_lower[7]),   # drop phi
+  prior_upper   = c(prior_upper[1:5], prior_upper[7]),
+  par_names     = c("b0", "b1", "b2", "b3", "b4", "sigma"),
+  iterations    = 20000,
+  burn_in       = 5000,
+  thin          = 10
+)
+```
+
+```{r compare-ar, fig.height=5}
+# Predictions from both models (MAP estimates)
+pred_ar <- predict_at_obs(
+  result$map["b0"], result$map["b1"], result$map["b2"],
+  result$map["b3"], result$map["b4"], result$map["phi"]
+)
+
+pred_no_ar <- result_no_ar$map["b0"] +
+              result_no_ar$map["b1"] * WBD_obs +
+              result_no_ar$map["b2"] * SedRate_obs +
+              result_no_ar$map["b3"] * GrainSize_obs +
+              result_no_ar$map["b4"] * CaFe_obs
+
+comparison_df <- data.frame(
+  age      = rep(obs_ages, 2),
+  G_pred   = c(pred_ar, pred_no_ar),
+  model    = rep(c("With AR term", "Without AR term"), each = n_obs)
+)
+
+ggplot() +
+  geom_point(data = obs_df, aes(x = age, y = G_obs), size = 4, color = "black") +
+  geom_errorbar(data = obs_df,
+                aes(x = age, ymin = G_obs - sigma_eff, ymax = G_obs + sigma_eff),
+                width = 3, color = "black") +
+  geom_line(data = comparison_df, aes(x = age, y = G_pred, color = model, linetype = model),
+            linewidth = 1.2) +
+  geom_point(data = comparison_df, aes(x = age, y = G_pred, color = model), size = 2) +
+  scale_x_reverse(name = "Age (yr BP)") +
+  scale_color_manual(values = c("steelblue", "goldenrod")) +
+  labs(title = "MAP predictions: with vs. without AR term",
+       y = "Glacier coverage (%)", color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+```{r ar-residuals}
+# RMSE comparison
+rmse_ar    <- sqrt(mean((pred_ar    - G_obs)^2))
+rmse_no_ar <- sqrt(mean((pred_no_ar - G_obs)^2))
+
+cat(sprintf("RMSE with AR term:    %.2f %%\n", rmse_ar))
+cat(sprintf("RMSE without AR term: %.2f %%\n", rmse_no_ar))
+```
+
+The AR term captures the temporal correlation in glacier behavior that the proxy variables alone cannot explain. Without it, predictions can swing more wildly between time steps, misrepresenting the inertia of a real glacier system. Including it typically reduces residuals and produces more physically plausible reconstructions.
+
+
+# 14. Discussion
+
+**What we learned about the glacier system:** The posterior distributions tell us not just point estimates of the regression coefficients but how *certain* we are about each one. A broad posterior for $\beta_2$ (SedRate) might indicate that sedimentation rate is less uniquely informative than WBD, perhaps because it co-varies with other predictors. A narrow posterior for $\varphi$ near 0.75 confirms the strong year-to-year (or decade-to-decade) persistence of glacier state.
+
+**The limits of sparse calibration data:** With only 10 observations, some parameters are genuinely underdetermined -- the data don't have enough information to pin them down precisely. This is not a failure of Bayesian inference; it's an honest answer. A frequentist model would produce similarly uncertain estimates, but might present them with false precision through standard errors that assume asymptotic behavior.
+
+**Sign constraints as scientific judgment:** The prior bounds we used encode decades of glaciological knowledge. If the MCMC posterior piles up against a prior boundary (e.g., $\beta_1$ hugging 0), that's a signal worth investigating: either the proxy really isn't informative, or the sign constraint is wrong. The prior is not merely a regularizer -- it's a scientific hypothesis.
+
+**Extending this framework:**
+- *Non-stationary relationships*: The regression coefficients are assumed constant over 4000 years. In reality, the relationship between sediment proxies and glacier extent may shift as climate regimes change. Time-varying coefficients (e.g., a sliding-window regression) would address this.
+- *Multiple cores*: Fitting multiple cores simultaneously, with shared coefficients and site-specific offsets, would improve calibration and reduce posterior uncertainty.
+- *Non-Gaussian errors*: The Gaussian likelihood assumes symmetric errors. If glacier coverage is bounded at 0% and 100%, a **beta-regression or logit-normal model might be more appropriate**.

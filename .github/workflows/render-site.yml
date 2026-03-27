@@ -7,6 +7,7 @@ on:
       - 'EmmaBayesExample/**'
       - 'BayesSoilCarbon_ACE.Rmd'
       - 'dat.ace.horizons.csv'
+      - 'BayesGlacier_LinearModel.Rmd'
       - '.github/workflows/render-site.yml'
   workflow_dispatch:
 
@@ -28,6 +29,50 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need the previous commit to diff against
+
+      - name: Detect changed Rmd files
+        id: changed
+        run: |
+          # Render everything on workflow_dispatch, first push, or workflow file change.
+          # Otherwise render only the Rmd files touched in this commit.
+          BEFORE="${{ github.event.before }}"
+          EVENT="${{ github.event_name }}"
+
+          if [ "$EVENT" = "workflow_dispatch" ] || \
+             [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "Rendering all files (manual trigger or first push)"
+            echo "render_1pool=true"   >> $GITHUB_OUTPUT
+            echo "render_3pool=true"   >> $GITHUB_OUTPUT
+            echo "render_ace=true"     >> $GITHUB_OUTPUT
+            echo "render_glacier=true" >> $GITHUB_OUTPUT
+          else
+            CHANGED=$(git diff --name-only "$BEFORE" "${{ github.sha }}")
+            echo "Changed files:"
+            echo "$CHANGED"
+
+            # If the workflow file itself changed, re-render everything
+            if echo "$CHANGED" | grep -q 'render-site.yml'; then
+              echo "Workflow file changed -- rendering all files"
+              echo "render_1pool=true"   >> $GITHUB_OUTPUT
+              echo "render_3pool=true"   >> $GITHUB_OUTPUT
+              echo "render_ace=true"     >> $GITHUB_OUTPUT
+              echo "render_glacier=true" >> $GITHUB_OUTPUT
+            else
+              echo "render_1pool=$(echo "$CHANGED"   | grep -q 'BayesSoilCarbon_1Pool.Rmd'    && echo true || echo false)" >> $GITHUB_OUTPUT
+              echo "render_3pool=$(echo "$CHANGED"   | grep -q 'BayesSoilCarbon_3Pool.Rmd'    && echo true || echo false)" >> $GITHUB_OUTPUT
+              echo "render_ace=$(echo "$CHANGED"     | grep -q 'BayesSoilCarbon_ACE.Rmd\|dat\.ace\.horizons\.csv' && echo true || echo false)" >> $GITHUB_OUTPUT
+              echo "render_glacier=$(echo "$CHANGED" | grep -q 'BayesGlacier_LinearModel.Rmd' && echo true || echo false)" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Restore cached rendered HTML
+        uses: actions/cache@v4
+        with:
+          path: _site
+          key: rendered-html-${{ github.sha }}
+          restore-keys: rendered-html-
 
       - name: Setup R
         uses: r-lib/actions/setup-r@v2
@@ -56,37 +101,52 @@ jobs:
         shell: Rscript {0}
 
       - name: Render 1-pool tutorial
+        if: steps.changed.outputs.render_1pool == 'true'
         timeout-minutes: 30
         run: |
           rmarkdown::render(
             "EmmaBayesExample/BayesSoilCarbon_1Pool.Rmd",
-            output_dir = "_site",
+            output_dir  = "_site",
             output_file = "BayesSoilCarbon_1Pool.html"
           )
         shell: Rscript {0}
 
       - name: Render 3-pool tutorial
+        if: steps.changed.outputs.render_3pool == 'true'
         timeout-minutes: 60
         run: |
           rmarkdown::render(
             "EmmaBayesExample/BayesSoilCarbon_3Pool.Rmd",
-            output_dir = "_site",
+            output_dir  = "_site",
             output_file = "BayesSoilCarbon_3Pool.html"
           )
         shell: Rscript {0}
 
       - name: Render ACE tutorial
+        if: steps.changed.outputs.render_ace == 'true'
         timeout-minutes: 90
         run: |
           rmarkdown::render(
             "BayesSoilCarbon_ACE.Rmd",
-            output_dir = "_site",
+            output_dir  = "_site",
             output_file = "BayesSoilCarbon_ACE.html"
+          )
+        shell: Rscript {0}
+
+      - name: Render glacier tutorial
+        if: steps.changed.outputs.render_glacier == 'true'
+        timeout-minutes: 60
+        run: |
+          rmarkdown::render(
+            "BayesGlacier_LinearModel.Rmd",
+            output_dir  = "_site",
+            output_file = "BayesGlacier_LinearModel.html"
           )
         shell: Rscript {0}
 
       - name: Create index page
         run: |
+          mkdir -p _site
           cat > _site/index.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html lang="en">
@@ -117,6 +177,10 @@ jobs:
               <li>
                 <a href="BayesSoilCarbon_ACE.html">3. ACE Post-Fire Sites</a>
                 <div class="desc">Applies the 3-pool Bayesian framework to real post-fire data from black spruce sites in Alaska. Compares decomposition rates and carbon inputs between spruce and deciduous vegetation trajectories.</div>
+              </li>
+              <li>
+                <a href="BayesGlacier_LinearModel.html">4. Glacier Reconstruction</a>
+                <div class="desc">Bayesian AR(1) linear regression using sediment proxies to reconstruct 4000 years of glacier coverage. Covers sign-constrained priors, age uncertainty, and calibration vs. reconstruction.</div>
               </li>
             </ul>
           </body>

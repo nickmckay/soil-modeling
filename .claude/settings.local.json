@@ -8,7 +8,8 @@
       "Bash(Rscript -e \"rmarkdown::render\\('BayesSoilCarbon_ACE.Rmd'\\)\" 2>&1)",
       "Bash(gh api:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(Rscript -e \"rmarkdown::render\\('BayesGlacier_LinearModel.Rmd'\\)\" 2>&1)"
     ]
   }
 }
