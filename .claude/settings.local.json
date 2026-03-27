@@ -4,7 +4,11 @@
       "Bash(Rscript:*)",
       "Bash(git -C /Users/nicholas/GitHub/soil-modeling remote -v)",
       "Bash(git -C /Users/nicholas/GitHub/soil-modeling symbolic-ref --short refs/remotes/origin/HEAD)",
-      "Bash(git -C /Users/nicholas/GitHub/soil-modeling branch -a)"
+      "Bash(git -C /Users/nicholas/GitHub/soil-modeling branch -a)",
+      "Bash(Rscript -e \"rmarkdown::render\\('BayesSoilCarbon_ACE.Rmd'\\)\" 2>&1)",
+      "Bash(gh api:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }
